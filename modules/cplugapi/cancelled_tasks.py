@@ -30,13 +30,18 @@ class _Registry:
             now = time.monotonic()
             # OrderedDict.__setitem__ keeps existing key in place; explicit
             # move_to_end ensures recency-ordered eviction works even on a
-            # re-add of an already-present id_task.
+            # re-add of an already-present id_task. Since time.monotonic()
+            # is non-decreasing, position-by-insertion-order matches order
+            # by add timestamp.
             self._entries[id_task] = now
             self._entries.move_to_end(id_task)
             self._evict_locked(now)
 
     def has(self, id_task: str) -> bool:
         with self._lock:
+            # Eviction must run before the membership test so an entry
+            # past its TTL is correctly reported absent. The walk is
+            # O(expired-at-head); on a healthy registry this is zero.
             self._evict_locked(time.monotonic())
             return id_task in self._entries
 
@@ -56,7 +61,7 @@ class _Registry:
         with self._lock:
             self._entries.clear()
 
-    def __len__(self) -> int:
+    def size(self) -> int:
         with self._lock:
             return len(self._entries)
 
@@ -65,7 +70,4 @@ _registry = _Registry()
 add = _registry.add
 has = _registry.has
 reset = _registry.reset
-
-
-def __len__() -> int:  # convenience for tests
-    return len(_registry)
+size = _registry.size

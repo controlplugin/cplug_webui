@@ -40,11 +40,16 @@ jobs:
       - name: Install test dependencies
         run: python -m pip install --upgrade pip fastapi pytest httpx
 
-      - name: Resolve build-time commit env vars
+      - name: Resolve build-time env vars
         id: commits
         run: |
           fork_sha=$(git rev-parse --short HEAD)
           echo "CPLUG_FORK_COMMIT=$fork_sha" >> "$GITHUB_ENV"
+
+          # Pin the build date to commit author date so support tickets
+          # can correlate builds without per-request drift.
+          build_date=$(git show -s --format=%cI HEAD)
+          echo "CPLUG_FORK_BUILD_DATE=$build_date" >> "$GITHUB_ENV"
 
           # Try to resolve upstream/neo commit; fall back to "unknown" so
           # the build never fails on a fork without the upstream remote.

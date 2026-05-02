@@ -72,4 +72,4 @@ def test_no_crash_under_concurrent_cancellation(
     )
     # The cancelled-tasks registry must respect its hard cap even under
     # heavy concurrent add pressure.
-    assert len(cancelled_tasks._registry) <= cancelled_tasks._MAX_ENTRIES
+    assert cancelled_tasks.size() <= cancelled_tasks._MAX_ENTRIES

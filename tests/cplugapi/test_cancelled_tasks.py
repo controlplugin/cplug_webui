@@ -43,7 +43,7 @@ def test_max_entries_backstop(clean_cancelled):
     overage = 50
     for i in range(cancelled_tasks._MAX_ENTRIES + overage):
         cancelled_tasks.add(f"task-{i:05d}")
-    assert len(cancelled_tasks._registry) == cancelled_tasks._MAX_ENTRIES
+    assert cancelled_tasks.size() == cancelled_tasks._MAX_ENTRIES
     # The first `overage` entries should have been evicted.
     for i in range(overage):
         assert not cancelled_tasks.has(f"task-{i:05d}")
@@ -64,11 +64,21 @@ def test_concurrent_adds_are_safe(clean_cancelled):
     for t in threads:
         t.join()
     # 8 workers × 50 adds = 400 distinct keys (well under MAX_ENTRIES).
-    assert len(cancelled_tasks._registry) == 400
+    assert cancelled_tasks.size() == 400
 
 
 def test_reset_clears_all(clean_cancelled):
     for i in range(10):
         cancelled_tasks.add(f"task-{i}")
     cancelled_tasks.reset()
-    assert len(cancelled_tasks._registry) == 0
+    assert cancelled_tasks.size() == 0
+
+
+def test_has_returns_true_for_within_ttl_entries(clean_cancelled):
+    """An entry within TTL is reported present even when newer siblings
+    have been added on top."""
+    cancelled_tasks.add("first")
+    cancelled_tasks.add("second")
+    assert cancelled_tasks.has("first")
+    assert cancelled_tasks.has("second")
+    assert cancelled_tasks.size() == 2

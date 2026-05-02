@@ -6,6 +6,7 @@ surface. Keeps upstream-rebase conflicts to one line.
 
 from __future__ import annotations
 
+import threading
 from typing import Callable, Optional
 
 from fastapi import APIRouter, Depends, FastAPI
@@ -19,6 +20,12 @@ from . import (
 )
 
 PREFIX = "/cplugapi/v1"
+
+# Stamped onto ``app.state`` by ``setup_cplugapi`` so a second invocation
+# (test reuse, webui reload) returns early instead of double-registering
+# routes — FastAPI does not dedupe.
+_MOUNT_FLAG = "cplugapi_mounted"
+_mount_lock = threading.Lock()
 
 
 def _register_capabilities() -> None:
@@ -40,7 +47,20 @@ def setup_cplugapi(
     applied to every route EXCEPT ``/identify`` — that endpoint must stay
     unauthenticated so the client can probe a backend before deciding
     whether to send credentials (see Track 05 §5.1).
+
+    Idempotent and thread-safe: concurrent callers serialize on a
+    module-level lock so route registration happens at most once per
+    ``app`` instance.
     """
+    with _mount_lock:
+        if getattr(app.state, _MOUNT_FLAG, False):
+            return
+
+        _do_mount(app, auth_dependency)
+        setattr(app.state, _MOUNT_FLAG, True)
+
+
+def _do_mount(app: FastAPI, auth_dependency: Optional[Callable]) -> None:
     _register_capabilities()
 
     public = APIRouter()
@@ -54,7 +74,8 @@ def setup_cplugapi(
     version_endpoint.attach(private)
     session_cancel.attach(private)
 
-    # Smoke endpoint — Track 05 T17 acceptance.
+    # Smoke endpoint — Track 05 T17 acceptance. Underscore prefix marks
+    # it as implementation-internal (not advertised as a capability).
     @private.get("/_ping")
     def _ping() -> dict:
         return {"ok": True}

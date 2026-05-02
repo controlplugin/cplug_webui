@@ -24,6 +24,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def _install_stubs() -> None:
+    # Belt-and-suspenders: refuse to clobber a real running webui's
+    # progress/shared modules. The presence of ``__file__`` is the
+    # reliable distinguisher — stubs we install have no file, real
+    # modules loaded from disk do.
+    existing = sys.modules.get("modules.progress")
+    if existing is not None and getattr(existing, "__file__", None):
+        raise RuntimeError(
+            "refusing to stub modules.progress: real module already loaded. "
+            "Run this script as a standalone process, not in-webui."
+        )
+
     progress = types.ModuleType("modules.progress")
     progress.pending_tasks = OrderedDict()  # type: ignore[attr-defined]
     progress.current_task = None  # type: ignore[attr-defined]
@@ -52,7 +63,7 @@ def main() -> int:
 
     output = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("cplugapi-openapi.json")
     output.write_text(json.dumps(app.openapi(), indent=2), encoding="utf-8")
-    print(f"wrote {output}")
+    sys.stdout.write(f"wrote {output}\n")
     return 0
 
 

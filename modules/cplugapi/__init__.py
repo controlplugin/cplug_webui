@@ -8,19 +8,23 @@ Spec: ``D:/GitHub/ControlPlugin_WebUI/plan/05-cplugapi-v1/plan.md``.
 """
 
 from .__version__ import (
+    FORK_BUILD_DATE,
     FORK_COMMIT,
     FORK_NAME,
     FORK_VERSION,
+    UPSTREAM_BRANCH,
     UPSTREAM_COMMIT,
     UPSTREAM_NAME,
 )
 from .router import PREFIX, setup_cplugapi
 
 __all__ = [
+    "FORK_BUILD_DATE",
     "FORK_COMMIT",
     "FORK_NAME",
     "FORK_VERSION",
     "PREFIX",
+    "UPSTREAM_BRANCH",
     "UPSTREAM_COMMIT",
     "UPSTREAM_NAME",
     "setup_cplugapi",

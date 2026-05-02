@@ -98,3 +98,33 @@ def test_interrupt_failure_does_not_break_response(progress_stub, shared_stub, c
 
     body = _client().post(f"{PREFIX}/session/cancel/running").json()
     assert body == {"id_task": "running", "state": "cancelled"}
+
+
+def test_oversize_id_task_rejected(progress_stub, shared_stub, clean_cancelled, clean_capabilities):
+    """Path validation: ids past _ID_TASK_MAX must 422, not be stored."""
+    from modules.cplugapi.session_cancel import _ID_TASK_MAX
+
+    bad = "a" * (_ID_TASK_MAX + 1)
+    r = _client().post(f"{PREFIX}/session/cancel/{bad}")
+    assert r.status_code == 422
+
+    # Must not have leaked into the cancelled-tasks registry.
+    from modules.cplugapi import cancelled_tasks
+
+    assert not cancelled_tasks.has(bad)
+
+
+def test_id_task_with_disallowed_chars_rejected(progress_stub, shared_stub, clean_cancelled, clean_capabilities):
+    """Whitelist regex blocks control chars / spaces / unicode tricks."""
+    # Space — must be 422.
+    r = _client().post(f"{PREFIX}/session/cancel/has%20space")
+    assert r.status_code == 422
+
+
+def test_id_task_with_allowed_punctuation_accepted(progress_stub, shared_stub, clean_cancelled, clean_capabilities):
+    """Upstream task IDs use parens, dashes, colons, dots."""
+    progress_stub.pending_tasks["task(txt2img-A1B2C3D)"] = 1.0
+
+    r = _client().post(f"{PREFIX}/session/cancel/task(txt2img-A1B2C3D)")
+    assert r.status_code == 200
+    assert r.json()["state"] == "cancelled"

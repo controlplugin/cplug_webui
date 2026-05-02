@@ -11,10 +11,13 @@ fork-specific features on :func:`enabled_capabilities`.
 
 from __future__ import annotations
 
+import logging
 import threading
 from typing import Callable, Optional
 
 Predicate = Callable[[], bool]
+
+_log = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 _registry: dict[str, Predicate] = {}
@@ -51,8 +54,11 @@ def enabled_capabilities() -> list[str]:
         try:
             if predicate():
                 enabled.append(name)
-        except Exception:
-            # A misbehaving predicate must not poison /health.
+        except Exception as exc:
+            # A misbehaving predicate must not poison /health, but it
+            # should be visible to operators so the silent absence of a
+            # capability can be diagnosed.
+            _log.warning("cplugapi capability predicate %r failed: %s", name, exc)
             continue
     enabled.sort()
     return enabled

@@ -88,13 +88,18 @@ def test_health_detailed_does_not_500(progress_stub, clean_capabilities):
     client = _make_client()
     r = client.get(f"{PREFIX}/health?detailed=true")
     assert r.status_code == 200
+    body = r.json()
+    # Forward-compat keys MUST be present (null/empty when unimplemented).
+    assert "vram_used_mb" in body
+    assert "warm_pool_slots" in body
+    assert "active_attention_backend" in body
+    assert "comfy_finalization_tax_active" in body
 
 
 def test_version_returns_fork_constants(clean_capabilities):
-    # invalidate the module-level cache to ensure a fresh build for this test
     from modules.cplugapi import version_endpoint
 
-    version_endpoint._cache.invalidate()
+    version_endpoint.reset()
     client = _make_client()
     r = client.get(f"{PREFIX}/version")
     assert r.status_code == 200
@@ -103,18 +108,33 @@ def test_version_returns_fork_constants(clean_capabilities):
     assert body["upstream_branch"] == "neo"
     assert "python_version" in body
     assert "platform" in body
+    # Forward-compat keys must be present even when their data sources
+    # haven't shipped (Phase 3/5/6).
+    assert "loaded_extensions" in body
+    assert "attention_backend" in body
+    assert "active_quantization" in body
 
 
 def test_version_is_cached(clean_capabilities):
-    """A second hit returns the same object reference (cache-hit path)."""
+    """A second hit returns the same payload because of the 60 s cache."""
     from modules.cplugapi import version_endpoint
 
-    version_endpoint._cache.invalidate()
+    version_endpoint.reset()
     client = _make_client()
     a = client.get(f"{PREFIX}/version").json()
     b = client.get(f"{PREFIX}/version").json()
-    # Build dates must match because the cached payload was reused.
     assert a["fork_build_date"] == b["fork_build_date"]
+
+
+def test_version_cache_returns_independent_dicts(clean_capabilities):
+    """Mutating one cached payload must not poison the next caller."""
+    from modules.cplugapi import version_endpoint
+
+    version_endpoint.reset()
+    a = version_endpoint._cache.get(version_endpoint._build_payload)
+    a["fork"] = "MUTATED"
+    b = version_endpoint._cache.get(version_endpoint._build_payload)
+    assert b["fork"] != "MUTATED"
 
 
 def test_auth_dependency_protects_private_routes_only(clean_capabilities):
