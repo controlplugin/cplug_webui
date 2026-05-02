@@ -15,6 +15,8 @@ from . import (
     capabilities,
     health,
     identify,
+    preset,
+    runtime,
     session_cancel,
     version_endpoint,
 )
@@ -34,6 +36,7 @@ def _register_capabilities() -> None:
     capabilities.register("health")
     capabilities.register("version")
     capabilities.register("session/cancel")
+    capabilities.register("forge/preset")
 
 
 def setup_cplugapi(
@@ -56,6 +59,7 @@ def setup_cplugapi(
         if getattr(app.state, _MOUNT_FLAG, False):
             return
 
+        runtime.apply_runtime_tweaks()
         _do_mount(app, auth_dependency)
         setattr(app.state, _MOUNT_FLAG, True)
 
@@ -73,6 +77,7 @@ def _do_mount(app: FastAPI, auth_dependency: Optional[Callable]) -> None:
     health.attach(private)
     version_endpoint.attach(private)
     session_cancel.attach(private)
+    preset.attach(private)
 
     # Smoke endpoint — Track 05 T17 acceptance. Underscore prefix marks
     # it as implementation-internal (not advertised as a capability).
