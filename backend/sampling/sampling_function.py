@@ -21,9 +21,52 @@ from backend.sampling.condition import (
 )
 
 
+# cplug fork (audit 01 §4.6): bounded LRU for the feathered-ones mult
+# tensor. The pattern depends only on (area, full_shape, x_h, x_w,
+# strength, dtype, device); for the live-sketching loop these all stay
+# constant across hundreds of strokes, so a 4-slot cache absorbs nearly
+# every call. Returned tensors are .clone()'d on hit because the caller
+# multiplies them in-place downstream (e.g. ``mult * conds["mask"]`` is
+# safe but ``mult.mul_(...)`` is not).
+_FEATHER_MULT_CACHE: "collections.OrderedDict[tuple, torch.Tensor]" = collections.OrderedDict()
+_FEATHER_MULT_CACHE_MAX = 4
+# Width of the linear-ramp boundary feather (in latent pixels). Inherited
+# from upstream; controls how aggressively neighboring conds blend.
+_FEATHER_STEPS = 8
+
+
+def _build_feathered_mult(area, input_shape, x_h, x_w, strength, dtype, device) -> torch.Tensor:
+    key = (area, tuple(input_shape), x_h, x_w, strength, dtype, str(device))
+    cached = _FEATHER_MULT_CACHE.get(key)
+    if cached is not None:
+        _FEATHER_MULT_CACHE.move_to_end(key)
+        return cached.clone()
+
+    mult = torch.full(input_shape, strength, dtype=dtype, device=device)
+    rr = _FEATHER_STEPS
+    if area[2] != 0:
+        for t in range(rr):
+            mult[:, :, t : 1 + t, :] *= (1.0 / rr) * (t + 1)
+    if (area[0] + area[2]) < x_h:
+        for t in range(rr):
+            mult[:, :, area[0] - 1 - t : area[0] - t, :] *= (1.0 / rr) * (t + 1)
+    if area[3] != 0:
+        for t in range(rr):
+            mult[:, :, :, t : 1 + t] *= (1.0 / rr) * (t + 1)
+    if (area[1] + area[3]) < x_w:
+        for t in range(rr):
+            mult[:, :, :, area[1] - 1 - t : area[1] - t] *= (1.0 / rr) * (t + 1)
+
+    _FEATHER_MULT_CACHE[key] = mult
+    while len(_FEATHER_MULT_CACHE) > _FEATHER_MULT_CACHE_MAX:
+        _FEATHER_MULT_CACHE.popitem(last=False)
+    return mult.clone()
+
+
 def get_area_and_mult(conds, x_in, timestep_in):
     area = (x_in.shape[2], x_in.shape[3], 0, 0)
     strength = 1.0
+    # See _build_feathered_mult below for the no-mask cached fast path.
 
     if "timestep_start" in conds:
         timestep_start = conds["timestep_start"]
@@ -49,24 +92,13 @@ def get_area_and_mult(conds, x_in, timestep_in):
         assert mask.shape[2] == x_in.shape[3]
         mask = mask[:, area[2] : area[0] + area[2], area[3] : area[1] + area[3]] * mask_strength
         mask = mask.unsqueeze(1).repeat(input_x.shape[0] // mask.shape[0], input_x.shape[1], 1, 1)
+        mult = mask * strength
     else:
-        mask = torch.ones_like(input_x)
-    mult = mask * strength
-
-    if "mask" not in conds:
-        rr = 8
-        if area[2] != 0:
-            for t in range(rr):
-                mult[:, :, t : 1 + t, :] *= (1.0 / rr) * (t + 1)
-        if (area[0] + area[2]) < x_in.shape[2]:
-            for t in range(rr):
-                mult[:, :, area[0] - 1 - t : area[0] - t, :] *= (1.0 / rr) * (t + 1)
-        if area[3] != 0:
-            for t in range(rr):
-                mult[:, :, :, t : 1 + t] *= (1.0 / rr) * (t + 1)
-        if (area[1] + area[3]) < x_in.shape[3]:
-            for t in range(rr):
-                mult[:, :, :, area[1] - 1 - t : area[1] - t] *= (1.0 / rr) * (t + 1)
+        # cplug fork (audit 01 §4.6): the ones+feather mult tensor is
+        # invariant for fixed (area, x_in.shape, strength, dtype, device).
+        # Caching the gradient pattern avoids 4 explicit per-step Python
+        # loops in regional-prompt and inpaint workloads.
+        mult = _build_feathered_mult(area, input_x.shape, x_in.shape[2], x_in.shape[3], strength, input_x.dtype, input_x.device)
 
     conditioning = {}
     model_conds = conds["model_conds"]

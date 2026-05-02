@@ -1,4 +1,5 @@
 import dataclasses
+from functools import lru_cache
 from math import atan, exp, pi
 from typing import Callable
 
@@ -8,6 +9,16 @@ import torch
 from scipy import stats
 
 from modules import shared
+
+
+# cplug fork (audit 01 §4.5): the scipy.stats.beta.ppf call inside
+# beta_scheduler is the dominant cost when the Beta scheduler is active —
+# pure CPU, scales with N, recomputed every gen. The result depends only
+# on (n, alpha, beta) so a tiny LRU eliminates it across stroke replays.
+@lru_cache(maxsize=16)
+def _beta_ppf(n: int, alpha: float, beta: float) -> np.ndarray:
+    ts = 1 - np.linspace(0, 1, n, endpoint=False)
+    return stats.beta.ppf(ts, alpha, beta)
 
 
 def to_d(x: torch.Tensor, sigma: float, denoised: torch.Tensor):
@@ -142,8 +153,7 @@ def beta_scheduler(n, sigma_min, sigma_max, inner_model, device):
     beta = shared.opts.beta_dist_beta
 
     total_timesteps = len(inner_model.sigmas) - 1
-    ts = 1 - np.linspace(0, 1, n, endpoint=False)
-    ts = np.rint(stats.beta.ppf(ts, alpha, beta) * total_timesteps)
+    ts = np.rint(_beta_ppf(int(n), float(alpha), float(beta)) * total_timesteps)
 
     sigs = []
     last_t = -1

@@ -44,7 +44,18 @@ def initialize_forge():
         startup_timer.record("cuda_malloc")
 
     if args.expandable_segments:
-        try_expandable_segments()
+        # cplug fork (audit 01 §3.10): append expandable_segments to the
+        # allocator config before torch reads it. Mutually compatible with
+        # cudaMallocAsync (PyTorch ignores expandable_segments under that
+        # backend, so passing both is harmless). Upstream's
+        # try_expandable_segments() helper writes to a typo'd env var
+        # (PYTORCH_ALLOC_CONF instead of PYTORCH_CUDA_ALLOC_CONF) so we
+        # keep the inline implementation until upstream fixes that.
+        existing = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+        if "expandable_segments" not in existing:
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+                f"{existing},expandable_segments:True" if existing else "expandable_segments:True"
+            )
         startup_timer.record("expandable_segments")
 
     from backend import memory_management

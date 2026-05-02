@@ -174,6 +174,10 @@ class ModelPatcher:
         self.object_patches_backup = {}
 
         self.patches_uuid = uuid.uuid4()
+        # cplug fork (audit 01 §4.3): per-key uuid record for the LoRA
+        # merge skip. Initialized here so callers in load() / add_patches /
+        # patch_weight_to_device can assume the dict exists.
+        self._cplug_merged_uuid_per_key: dict[str, "uuid.UUID"] = {}
 
         self.model_options = {"transformer_options": {}}
         self.pinned = set()
@@ -408,7 +412,14 @@ class ModelPatcher:
 
     def add_patches(self, patches: list[dict], strength_patch: float = 1.0, strength_model: float = 1.0, *, filename: str = None, online_mode: bool = None):
         p = set()
-        model_sd = self.model.state_dict()
+        # cplug fork (audit 01 §4.4): cache the set of state_dict keys on
+        # the model so multi-LoRA loads stop copying the full state_dict
+        # just for membership checks. The set is invariant for a model's
+        # lifetime — patches mutate parameter values, not the key list.
+        keys = getattr(self.model, "_cplug_state_dict_keys", None)
+        if keys is None:
+            keys = set(self.model.state_dict().keys())
+            self.model._cplug_state_dict_keys = keys
 
         if online_mode:
             patch_destination = self.online_patches
@@ -426,13 +437,16 @@ class ModelPatcher:
                 if len(k) > 2:
                     function = k[2]
 
-            if key in model_sd:
+            if key in keys:
                 p.add(k)
                 current_patches = patch_destination.get(key, [])
                 current_patches.append((strength_patch, patches[k], strength_model, offset, function))
                 patch_destination[key] = current_patches
 
         self.patches_uuid = uuid.uuid4()
+        # cplug fork (audit 01 §4.3): patches changed; invalidate the
+        # per-key merge cache so the next load() actually re-merges.
+        self._cplug_merged_uuid_per_key = {}
         return list(p)
 
     def _process_online_loras(self):
@@ -495,6 +509,15 @@ class ModelPatcher:
         if key not in self.patches:
             return
 
+        # cplug fork (audit 01 §4.3): if this key was already merged for
+        # the current patches_uuid, the model already holds the patched
+        # weight tensor — re-merging produces the same numbers at the
+        # cost of one cast + one merge_lora_to_weight call per layer.
+        # Patcher mutations route through ``add_patches`` which resets
+        # this dict, so a stale hit is impossible.
+        if self._cplug_merged_uuid_per_key.get(key) == self.patches_uuid and key in self.backup:
+            return
+
         weight, set_func, convert_func = get_key_weight(self.model, key)
         inplace_update = self.weight_inplace_update or inplace_update
 
@@ -542,6 +565,11 @@ class ModelPatcher:
                 utils.set_attr(self.model, key, out_weight)
         else:
             set_func(out_weight, inplace_update=inplace_update, seed=string_to_seed(key))
+
+        # cplug fork (audit 01 §4.3): record the uuid this key was merged
+        # against so the next load() can early-out when patches_uuid is
+        # still the same.
+        self._cplug_merged_uuid_per_key[key] = self.patches_uuid
 
     def pin_weight_to_device(self, key):
         weight, set_func, convert_func = get_key_weight(self.model, key)

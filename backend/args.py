@@ -93,7 +93,16 @@ parser.add_argument("--force-non-blocking", action="store_true", help="Use non-b
 parser.add_argument("--cuda-malloc", action="store_true", help="improve memory allocation")
 parser.add_argument("--cuda-stream", type=int, nargs="?", metavar="NUM_STREAMS", const=2, help="improve offloading")
 parser.add_argument("--pin-shared-memory", action="store_true", help="improve RAM utilization")
-parser.add_argument("--expandable-segments", action="store_true", help="improve memory allocation ; experimental")
+parser.add_argument(
+    "--expandable-segments",
+    action="store_true",
+    help=(
+        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; mitigates CUDA "
+        "allocator fragmentation under ControlNet hot-swap (audit 01 §3.10). "
+        "Must be set before any CUDA initialization, so this flag wires "
+        "in the env var during launch."
+    ),
+)
 
 parser.add_argument("--fast-fp8", action="store_true", help="torch._scaled_mm")
 parser.add_argument("--fast-fp16", action="store_true", help="torch.backends.cuda.matmul.allow_fp16_accumulation")
@@ -103,6 +112,17 @@ parser.add_argument("--mmap-torch-files", action="store_true", help="Use mmap wh
 parser.add_argument("--disable-mmap", action="store_true", help="Don't use mmap when loading safetensors")
 
 parser.add_argument("--tiled-conv2d", type=int, default=0, metavar="TILE_SIZE", choices=[0, 64, 128, 256, 512], help="reduce VAE memory usage ; increase processing time")
+parser.add_argument(
+    "--no-channels-last",
+    action="store_true",
+    help=(
+        "Disable channels_last memory format on convolutional UNets "
+        "(SD1.5/SDXL/SD2/Anima). Default applies channels_last on those "
+        "architectures for ~10-25%% UNet step time on Ampere+ "
+        "(audit 01 §3.2). DiT models (Flux, SD3, Qwen, Lumina, etc.) are "
+        "untouched either way."
+    ),
+)
 
 
 class SageAttentionFuncs(enum.Enum):

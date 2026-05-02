@@ -4,6 +4,7 @@ import base64
 import io
 import random
 import string
+import threading
 import time
 from collections import OrderedDict
 from typing import List
@@ -19,6 +20,29 @@ pending_tasks = OrderedDict()
 finished_tasks = []
 recorded_results = []
 recorded_results_limit = 2
+
+# cplug fork (audit 01 §4.13): single-entry cache for the encoded preview
+# data URI. Keyed by ``shared.state.id_live_preview`` so the moment the
+# next frame lands, the old payload is evicted. Saves the PNG-encode +
+# base64 round-trip when multiple clients poll the same frame.
+#
+# FastAPI runs progress polls in a threadpool, so concurrent requests
+# can race on the cache. The lock is per-process and held only for the
+# microseconds of a dict swap — never around the encode itself, so it
+# does not serialize the slow path.
+_PREVIEW_CACHE_LOCK = threading.Lock()
+_PREVIEW_CACHE: dict[int, str] = {}
+
+
+def _preview_cache_get(current_id: int) -> str | None:
+    with _PREVIEW_CACHE_LOCK:
+        return _PREVIEW_CACHE.get(current_id)
+
+
+def _preview_cache_put(current_id: int, payload: str) -> None:
+    with _PREVIEW_CACHE_LOCK:
+        _PREVIEW_CACHE.clear()
+        _PREVIEW_CACHE[current_id] = payload
 
 
 def start_task(id_task):
@@ -123,28 +147,39 @@ def progressapi(req: ProgressRequest):
     if opts.live_previews_enable and req.live_preview:
         shared.state.set_current_image()
         if shared.state.id_live_preview != req.id_live_preview:
-            image = shared.state.current_image
-            if image is not None:
-                _video: bool = getattr(image, "is_animated", False)
-                _format = "gif" if _video else opts.live_previews_image_format
-                buffered = io.BytesIO()
+            current_id = shared.state.id_live_preview
+            # cplug fork (audit 01 §4.13): skip the PNG-encode + base64 hot
+            # path when we already encoded the same frame for a different
+            # client tick. The image only changes when id_live_preview
+            # increments, so a single (id, payload) cache is exact.
+            cached = _preview_cache_get(current_id)
+            if cached is not None:
+                live_preview = cached
+                id_live_preview = current_id
+            else:
+                image = shared.state.current_image
+                if image is not None:
+                    _video: bool = getattr(image, "is_animated", False)
+                    _format = "gif" if _video else opts.live_previews_image_format
+                    buffered = io.BytesIO()
 
-                if _format == "png":
-                    # using optimize for large images takes an enormous amount of time
-                    if max(*image.size) <= 256:
-                        save_kwargs = {"optimize": True}
+                    if _format == "png":
+                        # using optimize for large images takes an enormous amount of time
+                        if max(*image.size) <= 256:
+                            save_kwargs = {"optimize": True}
+                        else:
+                            save_kwargs = {"optimize": False, "compress_level": 1}
+                    elif _format == "gif":
+                        save_kwargs = {"save_all": True, "loop": 0}
                     else:
-                        save_kwargs = {"optimize": False, "compress_level": 1}
-                elif _format == "gif":
-                    save_kwargs = {"save_all": True, "loop": 0}
-                else:
-                    image = image.convert("RGB")
-                    save_kwargs = {}
+                        image = image.convert("RGB")
+                        save_kwargs = {}
 
-                image.save(buffered, format=_format, **save_kwargs)
-                base64_image = base64.b64encode(buffered.getvalue()).decode("ascii")
-                live_preview = f"data:image/{_format};base64,{base64_image}"
-                id_live_preview = shared.state.id_live_preview
+                    image.save(buffered, format=_format, **save_kwargs)
+                    base64_image = base64.b64encode(buffered.getvalue()).decode("ascii")
+                    live_preview = f"data:image/{_format};base64,{base64_image}"
+                    id_live_preview = current_id
+                    _preview_cache_put(current_id, live_preview)
 
     return ProgressResponse(active=active, queued=queued, completed=completed, progress=progress, eta=eta, live_preview=live_preview, id_live_preview=id_live_preview, textinfo=shared.state.textinfo)
 

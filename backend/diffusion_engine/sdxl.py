@@ -34,6 +34,11 @@ class StableDiffusionXL(ForgeDiffusionEngine):
             unet = UnetPatcher.from_model(model=huggingface_components["unet"], diffusers_scheduler=huggingface_components["scheduler"], config=estimated_config)
             self.use_shift = False
 
+        # cplug fork (audit 01 §3.2): convolutional UNet → channels_last.
+        from modules.cplugapi.runtime import apply_channels_last
+
+        apply_channels_last(unet.model.diffusion_model)
+
         self.text_processing_engine_l = ClassicTextProcessingEngine(
             text_encoder=clip.cond_stage_model.clip_l,
             tokenizer=clip.tokenizer.clip_l,
@@ -151,6 +156,11 @@ class StableDiffusionXLRefiner(ForgeDiffusionEngine):
         vae = VAE(model=huggingface_components["vae"])
 
         unet = UnetPatcher.from_model(model=huggingface_components["unet"], diffusers_scheduler=huggingface_components["scheduler"], config=estimated_config)
+
+        # cplug fork (audit 01 §3.2): convolutional UNet → channels_last.
+        from modules.cplugapi.runtime import apply_channels_last
+
+        apply_channels_last(unet.model.diffusion_model)
 
         self.text_processing_engine_g = ClassicTextProcessingEngine(
             text_encoder=clip.cond_stage_model.clip_g,

@@ -159,7 +159,7 @@ def get_total_memory(dev: torch.device = None, torch_total_too: bool = False):
     dev = dev or get_torch_device()
 
     if hasattr(dev, "type") and (dev.type == "cpu" or dev.type == "mps"):
-        mem_total = psutil.virtual_memory().total
+        mem_total = _psutil_total_cached()
         mem_total_torch = mem_total
     else:
         if directml_enabled:
@@ -924,6 +924,18 @@ def vae_dtype(device=None, allowed_dtypes=None) -> torch.dtype:
     if args.fp32_vae:
         return torch.float32
 
+    # cplug fork: prefer bf16 on Ampere+/Ada/Hopper for ~3x VAE decode speedup.
+    # bf16 numerical drift on VAE decode is sub-pixel; --fp32-vae is the
+    # explicit opt-out for users needing bit-exact upstream behavior.
+    target = vae_device() if device is None else device
+    if is_nvidia() and torch.cuda.is_available():
+        try:
+            major = torch.cuda.get_device_properties(target).major if target.type == "cuda" else 0
+        except Exception:
+            major = 0
+        if major >= 8:
+            return torch.bfloat16
+
     if should_use_bf16(vae_device()):
         return torch.bfloat16
 
@@ -1085,7 +1097,7 @@ def get_free_memory(dev: torch.device = None, torch_free_too: bool = False) -> i
     dev = dev or get_torch_device()
 
     if hasattr(dev, "type") and (dev.type == "cpu" or dev.type == "mps"):
-        mem_free_total = psutil.virtual_memory().available
+        mem_free_total = _psutil_available_cached()
         mem_free_torch = mem_free_total
     else:
         if directml_enabled:
@@ -1328,8 +1340,54 @@ def lora_compute_dtype(device: torch.device) -> torch.dtype:
 
 signal_empty_cache = False
 
+# cplug fork (audit 01 §5.1): cache psutil.virtual_memory() with a 500 ms
+# TTL. The CPU/MPS branches of get_total_memory / get_free_memory call it
+# repeatedly inside the free_memory unload loop; on Windows each call is
+# 1–5 ms, so a 4-LoRA gen can spend >50 ms inside psutil alone.
+_PSUTIL_CACHE_TTL_NS = 500_000_000  # 500 ms in nanoseconds
+_psutil_total_value: int | None = None
+_psutil_total_at: int = 0
+_psutil_available_value: int | None = None
+_psutil_available_at: int = 0
+
+
+def _psutil_total_cached() -> int:
+    global _psutil_total_value, _psutil_total_at
+    now = time.perf_counter_ns()
+    if _psutil_total_value is None or now - _psutil_total_at > _PSUTIL_CACHE_TTL_NS:
+        _psutil_total_value = psutil.virtual_memory().total
+        _psutil_total_at = now
+    return _psutil_total_value
+
+
+def _psutil_available_cached() -> int:
+    global _psutil_available_value, _psutil_available_at
+    now = time.perf_counter_ns()
+    if _psutil_available_value is None or now - _psutil_available_at > _PSUTIL_CACHE_TTL_NS:
+        _psutil_available_value = psutil.virtual_memory().available
+        _psutil_available_at = now
+    return _psutil_available_value
+
+
+# cplug fork (audit 01 §5.2): debounce soft_empty_cache. The unload paths
+# fire it on every LoRA change; gc.collect + empty_cache + ipc_collect
+# is GPU-synchronizing and adds 20-40 ms per gen with LoRA churn. The
+# 100 ms window is small enough not to mask real OOM pressure (callers
+# pass ``force=True`` to bypass).
+_SOFT_EMPTY_DEBOUNCE_NS = 100_000_000  # 100 ms in nanoseconds
+_soft_empty_last_at: int = 0
+
 
 def soft_empty_cache(force=False):
+    global _soft_empty_last_at
+    if not force:
+        now = time.perf_counter_ns()
+        if now - _soft_empty_last_at < _SOFT_EMPTY_DEBOUNCE_NS:
+            return
+        _soft_empty_last_at = now
+    else:
+        _soft_empty_last_at = time.perf_counter_ns()
+
     if cpu_state is CPUState.MPS:
         torch.mps.empty_cache()
     elif is_intel_xpu():

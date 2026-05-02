@@ -234,6 +234,13 @@ class StableDiffusionProcessing:
         self.cached_uc = [None, None, None]
         StableDiffusionProcessing.cached_c = [None, None, None]
         StableDiffusionProcessing.cached_uc = [None, None, None]
+        # cplug fork (audit 01 §4.1): also flush the secondary LRU.
+        try:
+            from modules.cplugapi import prompt_cache as _cplug_prompt_cache
+
+            _cplug_prompt_cache.clear()
+        except Exception:
+            pass
 
     def __post_init__(self):
         assert self.sampler_index is None
@@ -449,6 +456,24 @@ class StableDiffusionProcessing:
 
         cache = caches[0]
 
+        # cplug fork (audit 01 §4.1): consult the process-wide LRU before
+        # paying for a CLIP/T5 forward. The single-slot cache above is
+        # last-call only; the LRU survives across requests so an artist
+        # toggling CFG/emphasis without editing the prompt re-uses the
+        # encoded conditioning instead of re-encoding it (~22-35 ms SDXL).
+        from modules.cplugapi import prompt_cache as _cplug_prompt_cache
+
+        cached = _cplug_prompt_cache.get(cached_params)
+        if cached is not None:
+            cond, extra = cached
+            if extra:
+                shared.sd_model.extra_generation_params.update(extra)
+            cache[0] = cached_params
+            cache[1] = cond
+            if len(cache) > 2:
+                cache[2] = extra or {}
+            return cond
+
         with devices.autocast():
             shared.sd_model.set_clip_skip(int(opts.CLIP_stop_at_last_layers))
 
@@ -466,6 +491,7 @@ class StableDiffusionProcessing:
             backend.text_processing.classic_engine.last_extra_generation_params = {}
 
         cache[0] = cached_params
+        _cplug_prompt_cache.put(cached_params, cache[1], last_extra_generation_params)
         return cache[1]
 
     def setup_conds(self):

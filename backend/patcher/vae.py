@@ -120,6 +120,32 @@ def tiled_scale(samples, function, tile_x=64, tile_y=64, overlap=8, upscale_amou
     return tiled_scale_multidim(samples, function, (tile_y, tile_x), overlap=overlap, upscale_amount=upscale_amount, out_channels=out_channels, output_device=output_device)
 
 
+def _autoscale_tile(width: int, height: int, tile_x: int, tile_y: int, free_bytes: int, memory_used: int) -> tuple[int, int]:
+    """Grow conservative default tiles when there is headroom (audit 01 §3.4).
+
+    The OOM-fallback path used to always use the smallest tile sizes
+    (64 latent / 512 pixel). On a 24 GB card decoding a 1024² image, this
+    is wasteful: a single full-image pass would have fit comfortably.
+    Scale the per-axis tile by ``sqrt(free / memory_used)`` (memory scales
+    with H·W) and clamp to the actual image dimension so we never tile
+    beyond it.
+
+    Returns the original tile_x/tile_y when ``memory_used`` is non-positive
+    or free memory cannot be queried (defensive fallback).
+    """
+    if memory_used <= 0 or free_bytes <= 0:
+        return tile_x, tile_y
+    headroom = free_bytes / memory_used
+    if headroom <= 1.0:
+        return tile_x, tile_y
+    scale = math.sqrt(headroom)
+    new_x = min(width, int(tile_x * scale))
+    new_y = min(height, int(tile_y * scale))
+    new_x = max(tile_x, new_x)
+    new_y = max(tile_y, new_y)
+    return new_x, new_y
+
+
 class VAE:
     def __init__(self, model=None, device=None, dtype=None, no_init=False, *, is_wan=False, is_flux2=False, is_mugen=False):
         if no_init:
@@ -179,8 +205,22 @@ class VAE:
         return n
 
     def decode_tiled_(self, samples, tile_x=64, tile_y=64, overlap=16):
+        # cplug fork (audit 01 §3.4): single-pass with feathering instead of
+        # the 3-pass average. tiled_scale_multidim already feathers tile
+        # boundaries, so the average was a relic of the pre-feathering era
+        # and tripled compute for no quality gain. Mirrors current ComfyUI.
         decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)).float()
-        output = self.process_output((tiled_scale(samples, decode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device) + tiled_scale(samples, decode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device) + tiled_scale(samples, decode_fn, tile_x, tile_y, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device)) / 3.0)
+        output = self.process_output(
+            tiled_scale(
+                samples,
+                decode_fn,
+                tile_x,
+                tile_y,
+                overlap,
+                upscale_amount=self.upscale_ratio,
+                output_device=self.output_device,
+            )
+        )
         return output
 
     def decode_tiled_3d(self, samples, tile_t=999, tile_x=32, tile_y=32, overlap=(1, 8, 8)):
@@ -188,11 +228,18 @@ class VAE:
         return self.process_output(tiled_scale_multidim(samples, decode_fn, tile=(tile_t, tile_x, tile_y), overlap=overlap, upscale_amount=self.upscale_ratio, out_channels=self.output_channels, index_formulas=self.upscale_index_formula, output_device=self.output_device))
 
     def encode_tiled_(self, pixel_samples, tile_x=512, tile_y=512, overlap=64):
+        # cplug fork (audit 01 §3.4): single-pass; see decode_tiled_ note.
         encode_fn = lambda a: self.first_stage_model.encode((self.process_input(a)).to(self.vae_dtype).to(self.device)).float()
-        samples = tiled_scale(pixel_samples, encode_fn, tile_x, tile_y, overlap, upscale_amount=(1 / self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device)
-        samples += tiled_scale(pixel_samples, encode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount=(1 / self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device)
-        samples += tiled_scale(pixel_samples, encode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount=(1 / self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device)
-        samples /= 3.0
+        samples = tiled_scale(
+            pixel_samples,
+            encode_fn,
+            tile_x,
+            tile_y,
+            overlap,
+            upscale_amount=(1 / self.downscale_ratio),
+            out_channels=self.latent_channels,
+            output_device=self.output_device,
+        )
         return samples
 
     def encode_tiled_3d(self, samples, tile_t=9999, tile_x=512, tile_y=512, overlap=(1, 64, 64)):
@@ -233,6 +280,13 @@ class VAE:
     def decode_tiled(self, samples: torch.Tensor, tile_x: int = 64, tile_y: int = 64, overlap: int = 16):
         memory_used = self.memory_used_decode(samples.shape, self.vae_dtype)
         memory_management.load_models_gpu([self.patcher], memory_required=memory_used)
+
+        if not self.is_wan:
+            tile_x, tile_y = _autoscale_tile(
+                samples.shape[-1], samples.shape[-2], tile_x, tile_y,
+                free_bytes=memory_management.get_free_memory(self.device),
+                memory_used=memory_used,
+            )
 
         args = {
             "tile_x": tile_x,
@@ -287,6 +341,13 @@ class VAE:
 
         memory_used = self.memory_used_encode(pixel_samples.shape, self.vae_dtype)
         memory_management.load_models_gpu([self.patcher], memory_required=memory_used)
+
+        if not self.is_wan:
+            tile_x, tile_y = _autoscale_tile(
+                pixel_samples.shape[-1], pixel_samples.shape[-2], tile_x, tile_y,
+                free_bytes=memory_management.get_free_memory(self.device),
+                memory_used=memory_used,
+            )
 
         args = {
             "tile_x": tile_x,
