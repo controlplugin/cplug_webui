@@ -1,8 +1,7 @@
 """Capability registry — single source of truth for ``/cplugapi/v1/health.capabilities[]``.
 
 Capability strings follow the slash-only ``<area>/<feature>`` convention
-documented in
-``ControlPlugin_WebUI/plan/00-foundation/04-capability-registry.md`` §1.
+documented in the capability registry §1 (track 00 foundation).
 Dot notation (``transport.base64``) is treated as a registration error.
 
 Endpoint modules call :func:`register` at attach time. The client gates
