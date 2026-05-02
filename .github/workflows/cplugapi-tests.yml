@@ -2,7 +2,7 @@ name: cplugapi tests
 
 on:
   push:
-    branches: [neo]
+    branches: [main]
     paths:
       - 'modules/cplugapi/**'
       - 'tests/cplugapi/**'
@@ -11,7 +11,7 @@ on:
       - '.github/workflows/cplugapi-tests.yml'
       - 'pyproject.toml'
   pull_request:
-    branches: [neo]
+    branches: [main]
     paths:
       - 'modules/cplugapi/**'
       - 'tests/cplugapi/**'
