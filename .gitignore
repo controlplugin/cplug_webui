@@ -24,6 +24,7 @@ __pycache__
 /styles.csv
 /styles.csv.bak
 /sysinfo*.json
+/cplugapi-openapi.json
 /tmp
 /ui-config.json
 /user.css
