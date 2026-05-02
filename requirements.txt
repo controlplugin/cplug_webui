@@ -30,7 +30,7 @@ pyyaml==6.0.3
 rich==14.3.3
 safetensors==0.7.0
 scikit-image==0.25.2
-setuptools==69.5.1
+setuptools==70.3.0
 spandrel-extra-arches==0.2.0
 spandrel==0.4.2
 tomesd==0.1.3

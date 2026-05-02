@@ -9,11 +9,21 @@ runs, so endpoints exercise their real logic against in-memory state.
 
 from __future__ import annotations
 
+import os
 import sys
 import types
 from collections import OrderedDict
 
 import pytest
+
+# FastAPI ``TestClient`` defaults to ``Host: testserver``, which the
+# audit-02 security middleware (correctly) rejects in production. For
+# the test suite we extend the host allow-list with ``testserver`` once
+# at collection time so fixtures using plain ``TestClient(app)`` (no
+# ``base_url`` override) keep passing. Tests that monkeypatch this env
+# var see ``testserver`` as the captured pre-test value, so teardown
+# reverts here.
+os.environ["CPLUG_ALLOWED_HOSTS"] = "testserver"
 
 
 def _install_progress_stub() -> types.ModuleType:

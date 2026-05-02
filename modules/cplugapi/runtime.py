@@ -32,7 +32,29 @@ def apply_runtime_tweaks() -> None:
         return
     _APPLIED = True
 
+    # Audit 02 §C2 — flip the CUDA allocator to expandable_segments
+    # *before* anything below can initialise a CUDA context. Mitigates
+    # upstream Forge-Neo #1049.
+    from . import cuda_alloc
+
+    cuda_alloc.configure_expandable_segments()
+    cuda_alloc.register_capabilities()
+
     _enable_cudnn_benchmark()
+
+    # Audit 02 §C1 — torch.compile MegaCache. Loads the on-disk bundle
+    # if present and arms the at-exit save. Best-effort; never raises.
+    from . import megacache
+
+    megacache.apply()
+    megacache.register_capabilities()
+
+    # Audit 02 §C3 — defensive monkey-patch for upstream Forge-Neo #694
+    # (LoadedModel.is_dead crash on real_model=None after repeated swaps).
+    from . import memmgmt_patches
+
+    memmgmt_patches.apply()
+    memmgmt_patches.register_capabilities()
 
 
 def _enable_cudnn_benchmark() -> None:

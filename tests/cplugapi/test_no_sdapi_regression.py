@@ -75,8 +75,9 @@ def test_setup_is_thread_safe_under_concurrent_call(clean_capabilities):
         t.join()
 
     cplug_routes = [r for r in app.routes if hasattr(r, "path") and r.path.startswith(PREFIX)]
-    # 6 endpoints (identify, health, version, session/cancel, forge/preset, _ping).
-    assert len(cplug_routes) == 6
+    # 9 endpoints — Phase 1: identify, health, version, session/cancel,
+    # forge/preset, _ping; audit-02 Phase B: livez, readyz, queue.
+    assert len(cplug_routes) == 9
 
 
 def test_only_identify_is_unauthenticated(clean_capabilities):

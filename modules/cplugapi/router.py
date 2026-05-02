@@ -15,8 +15,13 @@ from . import (
     capabilities,
     health,
     identify,
+    idempotency,
+    livez_readyz,
     preset,
+    queue_endpoint,
+    request_id,
     runtime,
+    security_middleware,
     session_cancel,
     version_endpoint,
 )
@@ -37,6 +42,11 @@ def _register_capabilities() -> None:
     capabilities.register("version")
     capabilities.register("session/cancel")
     capabilities.register("forge/preset")
+    # Audit 02 — Phase A/B observability + hardening.
+    security_middleware.register_capabilities()
+    idempotency.register_capabilities()
+    livez_readyz.register_capabilities()
+    queue_endpoint.register_capabilities()
 
 
 def setup_cplugapi(
@@ -60,8 +70,29 @@ def setup_cplugapi(
             return
 
         runtime.apply_runtime_tweaks()
+        _install_middlewares(app)
         _do_mount(app, auth_dependency)
         setattr(app.state, _MOUNT_FLAG, True)
+
+
+def _install_middlewares(app: FastAPI) -> None:
+    """Install the path-scoped middlewares for ``/cplugapi/v1/*``.
+
+    Order matters: Starlette runs the most-recently-added middleware
+    first, so we install in *reverse* of the desired runtime order:
+
+    1. idempotency  (added first  → runs last  → wraps the handler)
+    2. request_id   (added second → runs middle → stamps state.request_id
+                                                 + echoes header on the way out)
+    3. security     (added last   → runs first  → rejects bad requests
+                                                 before any work happens)
+
+    All three are no-ops outside ``/cplugapi/v1/*`` so ``/sdapi/v1/*``
+    byte-identity (CLAUDE.md hard invariant 1) is preserved.
+    """
+    idempotency.install(app)
+    request_id.install(app)
+    security_middleware.install(app)
 
 
 def _do_mount(app: FastAPI, auth_dependency: Optional[Callable]) -> None:
@@ -78,6 +109,8 @@ def _do_mount(app: FastAPI, auth_dependency: Optional[Callable]) -> None:
     version_endpoint.attach(private)
     session_cancel.attach(private)
     preset.attach(private)
+    livez_readyz.attach(private)
+    queue_endpoint.attach(private)
 
     # Smoke endpoint — Track 05 T17 acceptance. Underscore prefix marks
     # it as implementation-internal (not advertised as a capability).
