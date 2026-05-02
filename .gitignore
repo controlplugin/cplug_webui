@@ -1,4 +1,5 @@
 .claude/
+plan/
 __pycache__
 **/tokenizer/tokenizer.json
 *.bin
