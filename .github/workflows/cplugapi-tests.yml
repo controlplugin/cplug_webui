@@ -1,0 +1,89 @@
+name: cplugapi tests
+
+on:
+  push:
+    branches: [neo]
+    paths:
+      - 'modules/cplugapi/**'
+      - 'tests/cplugapi/**'
+      - 'modules/api/api.py'
+      - 'scripts/export_cplugapi_openapi.py'
+      - '.github/workflows/cplugapi-tests.yml'
+      - 'pyproject.toml'
+  pull_request:
+    branches: [neo]
+    paths:
+      - 'modules/cplugapi/**'
+      - 'tests/cplugapi/**'
+      - 'modules/api/api.py'
+      - 'scripts/export_cplugapi_openapi.py'
+      - '.github/workflows/cplugapi-tests.yml'
+      - 'pyproject.toml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need full history so we can resolve the upstream/neo merge base
+          # for CPLUG_UPSTREAM_COMMIT. Shallow clones break that.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip fastapi pytest httpx
+
+      - name: Resolve build-time commit env vars
+        id: commits
+        run: |
+          fork_sha=$(git rev-parse --short HEAD)
+          echo "CPLUG_FORK_COMMIT=$fork_sha" >> "$GITHUB_ENV"
+
+          # Try to resolve upstream/neo commit; fall back to "unknown" so
+          # the build never fails on a fork without the upstream remote.
+          if git ls-remote --exit-code https://github.com/Haoming02/sd-webui-forge-classic.git neo >/dev/null 2>&1; then
+            upstream_sha=$(git ls-remote https://github.com/Haoming02/sd-webui-forge-classic.git neo | cut -f1 | cut -c1-7)
+            echo "CPLUG_UPSTREAM_COMMIT=$upstream_sha" >> "$GITHUB_ENV"
+          else
+            echo "CPLUG_UPSTREAM_COMMIT=unknown" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run cplugapi tests
+        run: python -m pytest tests/cplugapi -v --durations=10
+
+      - name: Export cplugapi OpenAPI spec
+        run: python scripts/export_cplugapi_openapi.py cplugapi-openapi.json
+
+      - name: Upload OpenAPI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cplugapi-openapi
+          path: cplugapi-openapi.json
+          if-no-files-found: error
+
+  smoke-sdapi-regression:
+    # Lightweight T20: verify cplugapi mount does NOT break /sdapi/v1/* by
+    # asserting all routes added under setup_cplugapi() live under the
+    # /cplugapi/v1/ prefix. The full-model end-to-end smoke (boot the
+    # webui, hit /sdapi/v1/sd-models, txt2img@256² 1-step, etc.) is a
+    # follow-up CI job that needs a runner with a small SDXL fixture.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip fastapi pytest httpx
+
+      - name: Run /sdapi regression unit smoke
+        run: python -m pytest tests/cplugapi/test_no_sdapi_regression.py -v
