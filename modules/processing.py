@@ -461,9 +461,14 @@ class StableDiffusionProcessing:
         # last-call only; the LRU survives across requests so an artist
         # toggling CFG/emphasis without editing the prompt re-uses the
         # encoded conditioning instead of re-encoding it (~22-35 ms SDXL).
+        # The function identity is part of the key because uc and c share
+        # the LRU but produce different return types (list[ScheduledPrompt-
+        # Conditioning] vs MulticondLearnedConditioning).
         from modules.cplugapi import prompt_cache as _cplug_prompt_cache
 
-        cached = _cplug_prompt_cache.get(cached_params)
+        lru_key = (getattr(function, "__qualname__", repr(function)), cached_params)
+
+        cached = _cplug_prompt_cache.get(lru_key)
         if cached is not None:
             cond, extra = cached
             if extra:
@@ -491,7 +496,7 @@ class StableDiffusionProcessing:
             backend.text_processing.classic_engine.last_extra_generation_params = {}
 
         cache[0] = cached_params
-        _cplug_prompt_cache.put(cached_params, cache[1], last_extra_generation_params)
+        _cplug_prompt_cache.put(lru_key, cache[1], last_extra_generation_params)
         return cache[1]
 
     def setup_conds(self):
