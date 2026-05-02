@@ -29,7 +29,7 @@ class UMT5TextProcessingEngine:
         self.tokens_start = 0
         self.tokens_end = -1
         self.end_token = empty[0]
-        self.pad_token = 0
+        self.id_pad = 0
 
     def tokenize(self, texts):
         return self.tokenizer(texts)["input_ids"]
@@ -75,7 +75,7 @@ class UMT5TextProcessingEngine:
             token_count += current_chunk_length
 
             if current_chunk_length < self.min_length:
-                chunk.tokens.extend([self.pad_token] * (self.min_length - current_chunk_length))
+                chunk.tokens.extend([self.id_pad] * (self.min_length - current_chunk_length))
                 chunk.multipliers.extend([1.0] * (self.min_length - current_chunk_length))
 
             chunks.append(chunk)
