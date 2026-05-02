@@ -32,6 +32,30 @@ _lock = threading.Lock()
 _slots: "OrderedDict[Any, tuple[Any, dict | None]]" = OrderedDict()
 
 
+def _freeze(value: Any) -> Any:
+    """Recursively convert ``value`` into a hashable form.
+
+    ``cached_params`` from ``StableDiffusionProcessing`` contains an
+    ``SdConditioning`` (a ``list`` subclass) and an ``extra_network_data``
+    dict — neither is hashable, so the raw tuple cannot be used as a dict
+    key. Upstream's single-slot cache only compares with ``==``, so it
+    never had to care; the LRU does.
+    """
+    if isinstance(value, tuple):
+        return tuple(_freeze(v) for v in value)
+    if isinstance(value, list):
+        return ("__list__", tuple(_freeze(v) for v in value))
+    if isinstance(value, dict):
+        return ("__dict__", tuple((k, _freeze(value[k])) for k in sorted(value, key=repr)))
+    if isinstance(value, set):
+        return ("__set__", tuple(sorted((_freeze(v) for v in value), key=repr)))
+    try:
+        hash(value)
+    except TypeError:
+        return ("__repr__", repr(value))
+    return value
+
+
 def get(key: Any) -> tuple[Any, dict | None] | None:
     """Return ``(conditioning, extra_params)`` for ``key`` or ``None``.
 
@@ -39,19 +63,21 @@ def get(key: Any) -> tuple[Any, dict | None] | None:
     captured at compute time (mirrors the ``cache[2]`` slot in the
     upstream cache structure).
     """
+    frozen = _freeze(key)
     with _lock:
-        if key in _slots:
-            value = _slots.pop(key)
-            _slots[key] = value
+        if frozen in _slots:
+            value = _slots.pop(frozen)
+            _slots[frozen] = value
             return value
         return None
 
 
 def put(key: Any, conditioning: Any, extra_params: dict | None) -> None:
+    frozen = _freeze(key)
     with _lock:
-        if key in _slots:
-            _slots.pop(key)
-        _slots[key] = (conditioning, extra_params)
+        if frozen in _slots:
+            _slots.pop(frozen)
+        _slots[frozen] = (conditioning, extra_params)
         while len(_slots) > _MAX_SLOTS:
             _slots.popitem(last=False)
 

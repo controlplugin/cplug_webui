@@ -60,3 +60,40 @@ def test_clear_empties_cache():
     prompt_cache.clear()
     assert prompt_cache.size() == 0
     assert prompt_cache.get(("k",)) is None
+
+
+class _SdConditioningLike(list):
+    """Stand-in for ``prompt_parser.SdConditioning`` (a list subclass)."""
+
+
+def test_handles_unhashable_components_in_key():
+    """``cached_params`` carries an SdConditioning (list) and an extra-network
+    dict — both unhashable. The LRU must accept them without raising."""
+    key = (
+        _SdConditioningLike(["a prompt", "another"]),
+        20,
+        None,
+        {"lora": [{"name": "x", "weight": 0.7}]},
+        512,
+        512,
+    )
+    prompt_cache.put(key, "cond", {"meta": 1})
+    # Equivalent-content key (different list/dict instances) must hit.
+    key2 = (
+        _SdConditioningLike(["a prompt", "another"]),
+        20,
+        None,
+        {"lora": [{"name": "x", "weight": 0.7}]},
+        512,
+        512,
+    )
+    assert prompt_cache.get(key2) == ("cond", {"meta": 1})
+
+
+def test_distinct_unhashable_keys_do_not_collide():
+    k1 = (_SdConditioningLike(["foo"]), {"a": 1})
+    k2 = (_SdConditioningLike(["bar"]), {"a": 1})
+    prompt_cache.put(k1, "v1", None)
+    prompt_cache.put(k2, "v2", None)
+    assert prompt_cache.get(k1) == ("v1", None)
+    assert prompt_cache.get(k2) == ("v2", None)
