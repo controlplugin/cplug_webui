@@ -243,8 +243,8 @@ class Api:
             self.add_api_route("/sdapi/v1/server-stop", self.stop_webui, methods=["POST"])
 
         # /cplugapi/v1/* — fork-specific endpoints (additive; never modifies /sdapi/v1/*).
-        # See modules/cplugapi/router.py and the spec at
-        # D:/GitHub/ControlPlugin_WebUI/plan/05-cplugapi-v1/plan.md.
+        # See modules/cplugapi/router.py; spec lives in track 05 of the
+        # sibling planning repo.
         from modules.cplugapi import setup_cplugapi
         setup_cplugapi(self.app, auth_dependency=self.auth if shared.cmd_opts.api_auth else None)
 
