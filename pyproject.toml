@@ -5,3 +5,8 @@ line-length = 1024
 target-version = "py311"
 exclude = ["extensions"]
 lint.select = ["N805", "S307", "S102", "T", "W", "F"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"

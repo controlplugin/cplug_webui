@@ -242,6 +242,12 @@ class Api:
             self.add_api_route("/sdapi/v1/server-restart", self.restart_webui, methods=["POST"])
             self.add_api_route("/sdapi/v1/server-stop", self.stop_webui, methods=["POST"])
 
+        # /cplugapi/v1/* — fork-specific endpoints (additive; never modifies /sdapi/v1/*).
+        # See modules/cplugapi/router.py and the spec at
+        # D:/GitHub/ControlPlugin_WebUI/plan/05-cplugapi-v1/plan.md.
+        from modules.cplugapi import setup_cplugapi
+        setup_cplugapi(self.app, auth_dependency=self.auth if shared.cmd_opts.api_auth else None)
+
         self.default_script_arg_txt2img = []
         self.default_script_arg_img2img = []
 
