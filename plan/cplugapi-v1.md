@@ -146,3 +146,66 @@ plan/cplugapi-v1.md        — this file
 Three rounds of code-scrutiny applied (bug-hunt, app-harden, spec-review,
 then two refactor passes resolving all Critical/High findings). Verdict
 from final pass: **SOLID**.
+
+---
+
+## Audit 01 optimization sprint (2026-05-01)
+
+Source: `plan/optimizations-01.md`. Verified each cited issue, then
+landed the changes that fit the rebase / API-stability rules. 56/56
+cplugapi tests passing post-sprint, ruff clean.
+
+### Landed
+
+**Phase A — Tier 0 + free defaults**
+- [x] **§2.1** — `backend/attention.py:60` — added missing `return` to `get_attn_precision`. Pure bug fix.
+- [x] **§2.2** — `backend/text_processing/umt5_engine.py:32,78` — renamed `pad_token` → `id_pad`. Pure bug fix.
+- [x] **§3.1** — `cudnn.benchmark` default-on via cplugapi runtime hook (new `modules/cplugapi/runtime.py`); `--autotune` flag still works for explicit upstream parity.
+- [x] **§3.3** — `backend/memory_management.py` `vae_dtype()` — bf16 on Ampere+/Ada/Hopper unless `--fp32-vae`.
+
+**Phase B — VAE & tiling**
+- [x] **§3.4** — `backend/patcher/vae.py` — single-pass `decode_tiled_` / `encode_tiled_` (was 3-pass average; redundant with feathering); added `_autoscale_tile` helper that grows tile size when free VRAM permits.
+
+**Phase C — Steady-state caches**
+- [x] **§4.1** — `modules/cplugapi/prompt_cache.py` (new) — process-wide LRU as second-tier behind upstream's single-slot prompt cache. 32 slots, ~1 MB budget.
+- [x] **§4.3** — `backend/patcher/base.py` `patch_weight_to_device` — early-out per key when `_cplug_merged_uuid_per_key[key] == self.patches_uuid`.
+- [x] **§4.4** — `backend/patcher/base.py` `add_patches` — cache `set(state_dict().keys())` on the model.
+- [x] **§4.5** — `modules/sd_schedulers.py` — `lru_cache` wrapper around `stats.beta.ppf` for the Beta scheduler hot path.
+- [x] **§4.6** — `backend/sampling/sampling_function.py` — `_FEATHER_MULT_CACHE` (4-slot LRU) for the no-mask `get_area_and_mult` feathering tensor.
+- [x] **§4.13** — `modules/progress.py` — single-entry `_PREVIEW_CACHE` keyed by `id_live_preview`; protected by `_PREVIEW_CACHE_LOCK` (FastAPI threadpool concurrency).
+
+**Phase D — Memory & loader**
+- [x] **§5.1** — `backend/memory_management.py` — `_psutil_total_cached` / `_psutil_available_cached` with 500 ms TTL.
+- [x] **§5.2** — `backend/memory_management.py` `soft_empty_cache` — 100 ms debounce window; `force=True` bypasses.
+
+**Phase E — Memory format & allocator**
+- [x] **§3.2** — `modules/cplugapi/runtime.py` `apply_channels_last` — applied from `sd15.py`, `sdxl.py` (both classes); skipped on Anima/DiT engines. Gated by `--no-channels-last` flag and Ampere+ check.
+- [x] **§3.10** — `--expandable-segments` flag (`backend/args.py`) wired into `modules_forge/initialization.py` BEFORE torch CUDA init.
+
+**Phase F — Approximate accelerators**
+- [x] **§3.5 / §3.6 / §6.3 / §6.4** — `modules/cplugapi/preset.py` (new) `POST /cplugapi/v1/forge/preset/{name}`. Two presets:
+  - `sketch` — TAESD preview, every-5-steps preview, ToMe 0.3, CUDA warmup.
+  - `default` — RGB preview, every-step, ToMe 0.0.
+- [x] **`forge/preset` capability** advertised in `/health.capabilities[]`.
+
+### Tests added
+
+```
+tests/cplugapi/
+├── test_prompt_cache.py    — LRU semantics, eviction order, MRU promotion
+├── test_runtime.py         — idempotency, no-torch fallback
+└── test_preset.py          — sketch/default behavior, capability advertised, 404 for unknown
+```
+
+`test_no_sdapi_regression.py` updated for the new endpoint count (5 → 6).
+
+### Deferred (with rationale)
+
+- **§2.3 xformers mask padding** — needs runtime verification against current xformers; the slice-back is not a no-op (it broadcasts the mask q-dim) so the safe minimal change is non-trivial.
+- **§3.5 / §3.6 default flips** — would change `/sdapi/v1/*` behavior. Routed through `forge/preset` instead.
+- **§3.7 RNG direct-on-device** — misdiagnosed: `randn_source` defaults to `"CPU"` for cross-system reproducibility (modules/shared_options.py:224); the existing GPU branch already exists. Switching the default is a visible image change, not a perf-only change.
+- **§4.2 / §4.7 / §4.8 / §4.9 / §4.10 / §4.11 / §4.12 / §4.14** — moderate complexity (hashing image bytes, restructuring batch loop, session-pin) or memory tradeoffs (GGUF dequant cache costs ~4× VRAM); revisit when the live-sketching workload has per-stroke timing data to direct the priority.
+- **§5.3 / §5.4 / §5.5 / §5.6 / §5.7 / §5.8 / §5.9 / §5.10 / §5.11 / §5.12 / §5.14 / §5.15** — small individual wins behind larger refactors of `backend/operations.py`, `backend/state_dict.py`, or the offload-stream path. Plan re-evaluation after baseline benchmarks.
+- **§6.1 DeepCache patcher / §6.2 TeaCache patcher** — ~30 LOC each per the audit, but require per-architecture validation (SDXL block topology vs Flux double/single blocks). Defer to a dedicated patcher track.
+- **§6.5 torch.compile via preset** — extension exists; needs warm-cache wiring and a "warming up" client UX. Defer.
+- **§6.6 async VAE decode / §6.7 sub-step cancel** — Track 05 Phase 2 architecture territory.
