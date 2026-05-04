@@ -1,3 +1,4 @@
+import logging
 import os
 from contextlib import closing
 from pathlib import Path
@@ -22,6 +23,8 @@ from modules.sd_models import get_closet_checkpoint_match
 from modules.shared import opts, state
 from modules.ui import plaintext_to_html
 from modules_forge import main_thread
+
+logger = logging.getLogger(__name__)
 
 
 def process_batch(p, input, output_dir, inpaint_mask_dir, args, to_scale=False, scale_by=1.0, use_png_info=False, png_info_props=None, png_info_dir=None):
@@ -184,18 +187,21 @@ def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, 
         mask = None
     elif mode == 1:  # img2img sketch
         mask = None
-        image = Image.alpha_composite(sketch, sketch_fg)
+        if sketch is not None and sketch_fg is not None:
+            image = Image.alpha_composite(sketch, sketch_fg)
     elif mode == 2:  # inpaint
-        image = init_img_with_mask
-        mask = init_img_with_mask_fg.getchannel("A").convert("L")
-        mask = Image.merge("RGBA", (mask, mask, mask, Image.new("L", mask.size, 255)))
+        if init_img_with_mask is not None and init_img_with_mask_fg is not None:
+            image = init_img_with_mask
+            mask = init_img_with_mask_fg.getchannel("A").convert("L")
+            mask = Image.merge("RGBA", (mask, mask, mask, Image.new("L", mask.size, 255)))
     elif mode == 3:  # inpaint sketch
-        image = Image.alpha_composite(inpaint_color_sketch, inpaint_color_sketch_fg)
-        mask = inpaint_color_sketch_fg.getchannel("A").convert("L")
-        short_side = min(mask.size)
-        dilation_size = int(0.015 * short_side) * 2 + 1
-        mask = mask.filter(ImageFilter.MaxFilter(dilation_size))
-        mask = Image.merge("RGBA", (mask, mask, mask, Image.new("L", mask.size, 255)))
+        if inpaint_color_sketch is not None and inpaint_color_sketch_fg is not None:
+            image = Image.alpha_composite(inpaint_color_sketch, inpaint_color_sketch_fg)
+            mask = inpaint_color_sketch_fg.getchannel("A").convert("L")
+            short_side = min(mask.size)
+            dilation_size = int(0.015 * short_side) * 2 + 1
+            mask = mask.filter(ImageFilter.MaxFilter(dilation_size))
+            mask = Image.merge("RGBA", (mask, mask, mask, Image.new("L", mask.size, 255)))
     elif mode == 4:  # inpaint upload mask
         image = init_img_inpaint
         mask = init_mask_inpaint
@@ -205,6 +211,30 @@ def img2img_function(id_task: str, request: gr.Request, mode: int, prompt: str, 
 
     image = images.fix_image(image)
     mask = images.fix_image(mask)
+
+    # Full denoise replaces init with pure noise, so a blank canvas is
+    # equivalent — accept that for ControlNet-only runs.
+    if image is None and mode == 0 and not is_batch and selected_scale_tab != 1 and float(denoising_strength) >= 1.0:
+        image = Image.new("RGB", (max(int(width), 64), max(int(height), 64)), (0, 0, 0))
+
+    if image is None and not is_batch:
+        if mode == 0 and float(denoising_strength) < 1.0:
+            msg = "img2img: no input image (set denoise to 1.0 for a blank canvas)"
+        else:
+            mode_labels = {0: "img2img", 1: "sketch", 2: "inpaint", 3: "inpaint sketch", 4: "inpaint upload"}
+            msg = f"{mode_labels.get(mode, f'mode {mode}')}: no input image provided"
+        logger.warning(msg)
+        try:
+            gr.Warning(msg)
+        except Exception:
+            pass
+        return (
+            gr.update(value=[], visible=True),
+            gr.update(value=None, visible=False),
+            "",
+            plaintext_to_html(msg),
+            "",
+        )
 
     if selected_scale_tab == 1 and not is_batch:
         assert image, "Can't scale by because no image is selected"

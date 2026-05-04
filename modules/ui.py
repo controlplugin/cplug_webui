@@ -868,7 +868,7 @@ def create_ui():
     for _interface, label, _ifid in interfaces:
         shared.tab_names.append(label)
 
-    with gr.Blocks(theme=shared.gradio_theme, analytics_enabled=False, title="Stable Diffusion", head=canvas_head) as demo:
+    with gr.Blocks(theme=shared.gradio_theme, analytics_enabled=False, title="Stable Diffusion : ControlPlugin", head=canvas_head) as demo:
         settings.add_quicksettings()
 
         parameters_copypaste.connect_paste_params_buttons()
@@ -932,7 +932,7 @@ def versions_html():
         _versions.append(f"xformers: {importlib.metadata.version('xformers')}")
 
     return f"""
-version: <a href="https://github.com/Haoming02/sd-webui-forge-classic/tree/neo">neo</a>
+version: <a href="https://github.com/controlplugin/cplug_webui">cplug_webui</a>
 &#x2000;•&#x2000;
 python: <span title="{sys.version}">{python_version}</span>
 &#x2000;•&#x2000;
