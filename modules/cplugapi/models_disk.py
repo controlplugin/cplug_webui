@@ -63,15 +63,44 @@ def _config_max() -> int:
 class ArchInfo:
     """Cached classification result for a checkpoint file.
 
-    ``error`` is non-None if the header peek failed; in that case
-    ``arch == ARCH_NOT_A_CHECKPOINT`` and ``dtype is None``. Storing
-    errors in the cache means a known-bad file isn't re-peeked every
-    request.
+    ``error`` is non-None if the header peek failed. ``dtype`` is
+    ``None`` in the error case. ``arch`` distinguishes:
+
+    - :data:`ARCH_UNKNOWN` — the file is plausibly a real checkpoint
+      (Forge has it in ``checkpoints_list``) but we couldn't classify
+      its arch (pickle format, transient I/O failure, corrupt header).
+      Clients should still surface it to users.
+    - :data:`ARCH_NOT_A_CHECKPOINT` — the file is structurally not a
+      single-file model (sharded-manifest, LoRA/VAE/TE-only signature).
+      Clients should hide it from mode pickers.
+
+    Storing errors in the cache means a known-bad file isn't re-peeked
+    every request.
     """
 
     arch: str
     dtype: Optional[str]
     error: Optional[dict]
+
+
+# Error codes from :mod:`header_peek` that indicate "couldn't peek, but
+# the file may still be a valid loadable checkpoint" — Forge has it in
+# ``checkpoints_list`` for a reason. Mapped to :data:`ARCH_UNKNOWN` so
+# the desktop client can still surface the model to users.
+#
+# ``unsupported_format`` is the one code that maps to
+# :data:`ARCH_NOT_A_CHECKPOINT` — it only fires for sharded-manifest
+# JSON files which genuinely aren't loadable single-file checkpoints.
+_ARCH_UNKNOWN_CODES = frozenset({
+    "model_not_found",
+    "permission_denied",
+    "invalid_safetensors",
+    "pickle_format",
+})
+
+
+def _arch_for_error_code(code: str) -> str:
+    return _arch.ARCH_UNKNOWN if code in _ARCH_UNKNOWN_CODES else _arch.ARCH_NOT_A_CHECKPOINT
 
 
 # Cache key dimensions (in order):
@@ -141,7 +170,7 @@ def _peek_and_classify(path: str) -> ArchInfo:
         peeked = header_peek.peek(path)
     except header_peek.HeaderPeekError as err:
         return ArchInfo(
-            arch=_arch.ARCH_NOT_A_CHECKPOINT,
+            arch=_arch_for_error_code(err.code),
             dtype=None,
             error={"code": err.code, "message": err.message},
         )
@@ -184,13 +213,13 @@ def get_arch_info(path: Union[str, Path]) -> ArchInfo:
         st = os.stat(p)
     except FileNotFoundError as err:
         return ArchInfo(
-            arch=_arch.ARCH_NOT_A_CHECKPOINT,
+            arch=_arch.ARCH_UNKNOWN,
             dtype=None,
             error={"code": "model_not_found", "message": str(err)},
         )
     except PermissionError as err:
         return ArchInfo(
-            arch=_arch.ARCH_NOT_A_CHECKPOINT,
+            arch=_arch.ARCH_UNKNOWN,
             dtype=None,
             error={"code": "permission_denied", "message": str(err)},
         )

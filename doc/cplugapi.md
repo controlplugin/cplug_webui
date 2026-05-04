@@ -205,12 +205,26 @@ Strict superset of `/sdapi/v1/sd-models`: same fields plus per-file
 }
 ```
 
-Per-file resilience: a single corrupt safetensors yields
+Per-file resilience: a single corrupt or pickle-format file yields
 `error: {code, message}` on its own record without 500ing the listing.
-Error codes: `model_not_found`, `permission_denied`,
-`invalid_safetensors`, `unsupported_format`. Cache key is content-
-addressable `(abs_path, mtime_ns, size, st_ino)` — file changes are
-picked up automatically. Cap via `CPLUG_MODELS_CACHE_MAX` (default 4096).
+Error codes split by what the client should do with the file:
+
+| Code | Meaning | `arch` label |
+|---|---|---|
+| `model_not_found` | File vanished between scan and peek | `unknown` |
+| `permission_denied` | EACCES at open | `unknown` |
+| `invalid_safetensors` | Header parse failed (truncated, corrupt, wrong format) | `unknown` |
+| `pickle_format` | `.ckpt` / `.pt` / `.pth` / `.bin` / `.gguf` — Forge can load it, we can't classify without unpickling | `unknown` |
+| `unsupported_format` | `.safetensors.index.json` sharded manifest — not a single-file checkpoint | `not_a_checkpoint` |
+
+`unknown` and `not_a_checkpoint` are both excluded from
+`available_arches`, but they differ in client UX: `unknown` records
+are real loadable models the client should still show; `not_a_checkpoint`
+records should be hidden from mode pickers entirely.
+
+Cache key is content-addressable `(abs_path, mtime_ns, size, st_ino)`
+— file changes are picked up automatically. Cap via
+`CPLUG_MODELS_CACHE_MAX` (default 4096).
 
 Capability: `models/disk-scan`.
 

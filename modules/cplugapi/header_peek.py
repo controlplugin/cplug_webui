@@ -38,10 +38,20 @@ _MAX_HEADER_BYTES = 100 * 1024 * 1024
 class HeaderPeekError(Exception):
     """Raised when a file cannot be peeked.
 
-    ``code`` is one of ``model_not_found``, ``permission_denied``,
-    ``invalid_safetensors``, ``unsupported_format`` — chosen so the
-    handler can map directly to a JSON error envelope without further
-    classification.
+    ``code`` is one of:
+
+    - ``model_not_found`` — file does not exist
+    - ``permission_denied`` — open() raised EACCES
+    - ``invalid_safetensors`` — header length implausible, or JSON
+      cannot be parsed (truncated / corrupt / wrong format)
+    - ``pickle_format`` — extension is ``.ckpt`` / ``.pt`` / ``.pth`` /
+      ``.bin`` / ``.gguf``. The file is *plausibly* a real checkpoint
+      that Forge can load via pickle, we just can't classify its arch
+      from outside without unpickling. Callers should treat as
+      "unknown arch", not "not a model".
+    - ``unsupported_format`` — path is a sharded-checkpoint manifest
+      (``.safetensors.index.json``). Genuinely not a single-file
+      checkpoint.
     """
 
     def __init__(self, code: str, message: str) -> None:
@@ -86,9 +96,13 @@ def _classify_path(p: str) -> Optional[HeaderPeekError]:
         )
     ext = os.path.splitext(pl)[1]
     if ext in _UNSUPPORTED_EXTS:
+        # Pickle-flavoured formats — Forge can still load these, we just
+        # can't classify the arch without unpickling. Surface as a
+        # distinct code so the caller can map to "unknown arch" rather
+        # than "not a checkpoint".
         return HeaderPeekError(
-            "unsupported_format",
-            f"{ext} files are not safetensors; deep parsing intentionally skipped",
+            "pickle_format",
+            f"{ext} files are pickle-format; deep parsing intentionally skipped",
         )
     return None
 
@@ -96,13 +110,11 @@ def _classify_path(p: str) -> Optional[HeaderPeekError]:
 def peek(path: Union[str, Path]) -> HeaderPeek:
     """Read just the JSON header of a safetensors file.
 
-    Raises :class:`HeaderPeekError` on:
-      - ``model_not_found`` — file does not exist
-      - ``permission_denied`` — open() raised EACCES
-      - ``unsupported_format`` — extension is .ckpt / .pt / .gguf or the
-        path is a sharded-checkpoint manifest (.safetensors.index.json)
-      - ``invalid_safetensors`` — header length implausible, or JSON
-        cannot be parsed (truncated / corrupt / wrong format)
+    Raises :class:`HeaderPeekError` with a code (see class docstring) so
+    the caller can decide whether the error means "real model, unknown
+    arch" (pickle_format / invalid_safetensors / model_not_found /
+    permission_denied) or "definitely not a single-file checkpoint"
+    (unsupported_format).
     """
     p = os.fspath(path)
     pre = _classify_path(p)

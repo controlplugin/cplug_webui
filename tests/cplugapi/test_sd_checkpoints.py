@@ -89,12 +89,18 @@ def test_truncated_file_yields_per_file_error(tmp_path, clean_capabilities):
     r = _make_client().get(f"{PREFIX}/models/sd-checkpoints")
     body = r.json()
     rec = body["checkpoints"][0]
-    assert rec["arch"] == "not_a_checkpoint"
+    # invalid_safetensors → arch=unknown (file may still be a real
+    # model — partial download, etc.). Excluded from available_arches
+    # so the mode picker doesn't surface "unknown" as a selectable mode.
+    assert rec["arch"] == "unknown"
     assert rec["error"]["code"] == "invalid_safetensors"
     assert body["available_arches"] == []
 
 
-def test_unsupported_extension_gguf(tmp_path, clean_capabilities):
+def test_pickle_format_gguf(tmp_path, clean_capabilities):
+    """Pickle-format files (.gguf/.ckpt/.pt) are loadable by Forge but
+    not arch-classifiable from outside — surface as unknown, not
+    not_a_checkpoint, so the desktop client still shows them."""
     bad = tmp_path / "weights.gguf"
     bad.write_bytes(b"GGUF-blob")
 
@@ -103,8 +109,23 @@ def test_unsupported_extension_gguf(tmp_path, clean_capabilities):
 
     r = _make_client().get(f"{PREFIX}/models/sd-checkpoints")
     rec = r.json()["checkpoints"][0]
-    assert rec["arch"] == "not_a_checkpoint"
-    assert rec["error"]["code"] == "unsupported_format"
+    assert rec["arch"] == "unknown"
+    assert rec["error"]["code"] == "pickle_format"
+
+
+def test_pickle_format_ckpt(tmp_path, clean_capabilities):
+    """A .ckpt that Forge has in checkpoints_list must surface as a
+    real (unknown-arch) model, not be marked not_a_checkpoint."""
+    bad = tmp_path / "legacy.ckpt"
+    bad.write_bytes(b"PYTORCH-PICKLE")
+
+    _stub_checkpoints([_info(str(bad), shorthash="00000000", sha256="0" * 64)])
+    models_disk.reset_cache()
+
+    r = _make_client().get(f"{PREFIX}/models/sd-checkpoints")
+    rec = r.json()["checkpoints"][0]
+    assert rec["arch"] == "unknown"
+    assert rec["error"]["code"] == "pickle_format"
 
 
 def test_mixed_batch_per_file_resilience(safetensors_factory, tmp_path, clean_capabilities):
@@ -141,7 +162,8 @@ def test_mixed_batch_per_file_resilience(safetensors_factory, tmp_path, clean_ca
     assert r.status_code == 200
     assert len(body["checkpoints"]) == 3
     arches = sorted(rec["arch"] for rec in body["checkpoints"])
-    assert arches == ["not_a_checkpoint", "sd15", "sdxl"]
+    # Truncated safetensors → unknown, not not_a_checkpoint.
+    assert arches == ["sd15", "sdxl", "unknown"]
     assert sorted(body["available_arches"]) == ["sd15", "sdxl"]
 
 

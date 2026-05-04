@@ -7,6 +7,20 @@ grouped by **Added / Changed / Fixed / Removed**.
 
 ## Unreleased
 
+### Fixed — `.ckpt` / `.gguf` mis-classified as `not_a_checkpoint`
+
+Live testing surfaced that `cardesigner.ckpt` (a real loadable Forge
+model) was being tagged `arch: not_a_checkpoint, error: unsupported_format`
+in `/cplugapi/v1/models/sd-checkpoints`, which would have caused the
+desktop client to hide it from every mode picker. Pickle-format
+checkpoints are loadable, just not classifiable from outside without
+unpickling — so they now report `arch: unknown` with a new
+`pickle_format` error code. `unsupported_format` is now reserved for
+genuine non-checkpoints (`.safetensors.index.json` sharded manifests).
+Same split applied to transient I/O failures (`model_not_found`,
+`permission_denied`) and corrupt-header (`invalid_safetensors`) — all
+map to `unknown` since the underlying file may still be a real model.
+
 ### Added — model architecture detection (`/cplugapi/v1/models/*`)
 
 Three new endpoints under the cplugapi surface so the desktop

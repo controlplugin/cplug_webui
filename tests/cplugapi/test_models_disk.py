@@ -92,8 +92,11 @@ def test_known_bad_file_is_cached_not_repeeked(tmp_path, monkeypatch):
     info1 = models_disk.get_arch_info(str(bad))
     info2 = models_disk.get_arch_info(str(bad))
     assert info1.error is not None
-    assert info1.arch == "not_a_checkpoint"
-    assert info2.arch == "not_a_checkpoint"
+    # Truncated safetensors → invalid_safetensors → arch=unknown
+    # (the file may still be a real model whose download is incomplete,
+    # so we don't tell the client to hide it).
+    assert info1.arch == "unknown"
+    assert info2.arch == "unknown"
     assert call_count["n"] == 1
 
 

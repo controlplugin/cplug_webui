@@ -42,17 +42,26 @@ def test_peek_missing_file(tmp_path):
     assert exc.value.code == "model_not_found"
 
 
-def test_peek_unsupported_extension_gguf(tmp_path):
+def test_peek_pickle_extension_gguf(tmp_path):
     p = tmp_path / "weights.gguf"
     p.write_bytes(b"GGUF-binary-blob")
     with pytest.raises(header_peek.HeaderPeekError) as exc:
         header_peek.peek(p)
-    assert exc.value.code == "unsupported_format"
+    assert exc.value.code == "pickle_format"
 
 
-def test_peek_unsupported_extension_ckpt(tmp_path):
+def test_peek_pickle_extension_ckpt(tmp_path):
     p = tmp_path / "legacy.ckpt"
     p.write_bytes(b"PYTORCH-PICKLE")
+    with pytest.raises(header_peek.HeaderPeekError) as exc:
+        header_peek.peek(p)
+    assert exc.value.code == "pickle_format"
+
+
+def test_peek_sharded_manifest_unsupported(tmp_path):
+    """Sharded-safetensors manifests are not single-file checkpoints."""
+    p = tmp_path / "model.safetensors.index.json"
+    p.write_text('{"metadata": {}, "weight_map": {}}', encoding="utf-8")
     with pytest.raises(header_peek.HeaderPeekError) as exc:
         header_peek.peek(p)
     assert exc.value.code == "unsupported_format"
