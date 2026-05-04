@@ -1,2 +1,2 @@
-version = "neo"
+version = "cplug_webui"
 release = "2.22"

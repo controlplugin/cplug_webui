@@ -1,11 +1,29 @@
 import shlex
+import shutil
 import subprocess
+import sys
 from copy import copy
 from functools import wraps
 
 
+def _ensure_uv() -> bool:
+    if shutil.which("uv"):
+        return True
+    print("[uv-hook] 'uv' not on PATH — bootstrapping via pip into the active venv...", flush=True)
+    result = subprocess.run([sys.executable, "-m", "pip", "install", "uv"])
+    if result.returncode != 0 or not shutil.which("uv"):
+        print("[uv-hook] failed to install uv; falling back to plain pip.", flush=True)
+        return False
+    return True
+
+
 def patch(symlink: bool):
     if hasattr(subprocess, "__original_run"):
+        return
+
+    # --uv was requested but the uv binary isn't installed yet. Bootstrap it
+    # so the launcher's default `--uv` flag doesn't break on fresh venvs.
+    if not _ensure_uv():
         return
 
     subprocess.__original_run = subprocess.run
