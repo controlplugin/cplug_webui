@@ -205,16 +205,21 @@ Strict superset of `/sdapi/v1/sd-models`: same fields plus per-file
 }
 ```
 
-Per-file resilience: a single corrupt or pickle-format file yields
+Per-file resilience: a single corrupt or unparseable file yields
 `error: {code, message}` on its own record without 500ing the listing.
-Error codes split by what the client should do with the file:
+Two-stage classification: safetensors header peek first (~ms), pickle
+fallthrough for `.ckpt` / `.pt` / `.pth` / `.bin` (hundreds of ms,
+amortised by LRU) via `torch.load(weights_only=True, map_location="meta")`
+— same classifier sentinels run against both formats. Error codes
+split by what the client should do with the file:
 
 | Code | Meaning | `arch` label |
 |---|---|---|
 | `model_not_found` | File vanished between scan and peek | `unknown` |
 | `permission_denied` | EACCES at open | `unknown` |
-| `invalid_safetensors` | Header parse failed (truncated, corrupt, wrong format) | `unknown` |
-| `pickle_format` | `.ckpt` / `.pt` / `.pth` / `.bin` / `.gguf` — Forge can load it, we can't classify without unpickling | `unknown` |
+| `invalid_safetensors` | Safetensors header parse failed (truncated, corrupt, wrong format) | `unknown` |
+| `pickle_parse_failed` | Tried `torch.load` but it failed (corrupt, `weights_only=True` refused a custom global, empty state-dict) | `unknown` |
+| `gguf_unsupported` | `.gguf` binary tensor format — separate parser, not implemented | `unknown` |
 | `unsupported_format` | `.safetensors.index.json` sharded manifest — not a single-file checkpoint | `not_a_checkpoint` |
 
 `unknown` and `not_a_checkpoint` are both excluded from

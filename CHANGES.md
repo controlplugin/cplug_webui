@@ -7,6 +7,24 @@ grouped by **Added / Changed / Fixed / Removed**.
 
 ## Unreleased
 
+### Added — pickle-format checkpoint classification
+
+`.ckpt` / `.pt` / `.pth` / `.bin` files now go through a second-stage
+classifier on `header_peek` fallthrough: `torch.load(weights_only=True,
+map_location="meta", mmap=True)` to read the state-dict shape without
+materialising tensor data and without running unrestricted unpickling.
+The same `classify_state_keys` sentinels apply, so a legacy A1111-era
+SDXL `.ckpt` now reports `arch: "sdxl"` identically to its safetensors
+sibling. Cost: hundreds of ms cold-scan vs ~ms for safetensors —
+amortised by the existing LRU cache. Common wrappers handled:
+`{"state_dict": ...}` (A1111), `{"model": ...}` (Lightning), bare
+state-dict (clean dumps).
+
+`.gguf` remains unsupported but now surfaces under a dedicated
+`gguf_unsupported` error code so the client can distinguish "format
+gap" from "tried and failed". (`modules/cplugapi/pickle_peek.py`,
+`modules/cplugapi/models_disk.py`)
+
 ### Fixed — `.ckpt` / `.gguf` mis-classified as `not_a_checkpoint`
 
 Live testing surfaced that `cardesigner.ckpt` (a real loadable Forge
