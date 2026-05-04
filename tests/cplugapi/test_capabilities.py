@@ -85,3 +85,21 @@ def test_register_is_thread_safe(clean_capabilities):
     enabled = capabilities.enabled_capabilities()
     assert len(enabled) == 200
     assert all(f"area/feature-{i}" in enabled for i in range(200))
+
+
+def test_model_arch_detection_capabilities_in_health(progress_stub, clean_capabilities):
+    """Model arch detection caps appear in /health response."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from modules.cplugapi import PREFIX, setup_cplugapi
+
+    app = FastAPI()
+    setup_cplugapi(app)
+    client = TestClient(app)
+    r = client.get(f"{PREFIX}/health")
+    assert r.status_code == 200
+    caps = r.json()["capabilities"]
+    assert "models/architecture" in caps
+    assert "models/disk-scan" in caps
+    assert "models/architectures-available" in caps

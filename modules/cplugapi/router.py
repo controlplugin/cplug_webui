@@ -12,6 +12,8 @@ from typing import Callable, Optional
 from fastapi import APIRouter, Depends, FastAPI
 
 from . import (
+    active_model,
+    architectures,
     capabilities,
     health,
     identify,
@@ -21,6 +23,7 @@ from . import (
     queue_endpoint,
     request_id,
     runtime,
+    sd_checkpoints,
     security_middleware,
     session_cancel,
     version_endpoint,
@@ -47,6 +50,10 @@ def _register_capabilities() -> None:
     idempotency.register_capabilities()
     livez_readyz.register_capabilities()
     queue_endpoint.register_capabilities()
+    # Model arch detection (/v1/models/*).
+    active_model.register_capabilities()
+    sd_checkpoints.register_capabilities()
+    architectures.register_capabilities()
 
 
 def setup_cplugapi(
@@ -122,6 +129,9 @@ def _do_mount(app: FastAPI, auth_dependency: Optional[Callable]) -> None:
     preset.attach(private)
     livez_readyz.attach(private)
     queue_endpoint.attach(private)
+    active_model.attach(private)
+    sd_checkpoints.attach(private)
+    architectures.attach(private)
 
     # Smoke endpoint — Track 05 T17 acceptance. Underscore prefix marks
     # it as implementation-internal (not advertised as a capability).
