@@ -34,6 +34,7 @@ from collections import OrderedDict
 from typing import Optional
 
 from fastapi import FastAPI, Request
+from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, Response
 
@@ -262,11 +263,18 @@ _install_lock = threading.Lock()
 
 
 def install(app: FastAPI) -> None:
-    """Attach the middleware to ``app``. Idempotent + thread-safe."""
+    """Attach the middleware to ``app``. Idempotent + thread-safe.
+
+    Uses ``user_middleware.insert`` rather than ``app.add_middleware`` so
+    the install path works after the Gradio app has already started — the
+    cplugapi mount runs post-launch in webui.py. Caller is responsible for
+    rebuilding the stack via ``app.build_middleware_stack()`` once all
+    middlewares are registered.
+    """
     with _install_lock:
         if getattr(app.state, _INSTALL_FLAG, False):
             return
-        app.add_middleware(CplugapiIdempotencyMiddleware)
+        app.user_middleware.insert(0, Middleware(CplugapiIdempotencyMiddleware))
         setattr(app.state, _INSTALL_FLAG, True)
 
 

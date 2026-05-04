@@ -50,6 +50,7 @@ import threading
 from typing import Awaitable, Callable, Iterable
 
 from fastapi import FastAPI
+from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -301,11 +302,17 @@ def install(app: FastAPI) -> None:
     Safe to call from a test fixture and from production wire-up; a
     second call on the same ``app`` is a no-op. Concurrent callers
     serialize on a module-level lock so route registration cannot race.
+
+    Inserts into ``user_middleware`` directly rather than calling
+    ``app.add_middleware`` — the cplugapi mount runs after the Gradio
+    app has started and ``add_middleware`` rejects post-launch calls.
+    Caller must invoke ``app.build_middleware_stack()`` after all
+    middlewares are registered.
     """
     with _install_lock:
         if getattr(app.state, _INSTALL_FLAG, False):
             return
-        app.add_middleware(CplugapiSecurityMiddleware)
+        app.user_middleware.insert(0, Middleware(CplugapiSecurityMiddleware))
         setattr(app.state, _INSTALL_FLAG, True)
 
 

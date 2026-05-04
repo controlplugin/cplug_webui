@@ -89,10 +89,21 @@ def _install_middlewares(app: FastAPI) -> None:
 
     All three are no-ops outside ``/cplugapi/v1/*`` so ``/sdapi/v1/*``
     byte-identity (CLAUDE.md hard invariant 1) is preserved.
+
+    The individual ``install()`` helpers append to ``app.user_middleware``
+    rather than calling ``app.add_middleware`` (which Starlette rejects
+    once the app has accepted its first request). After all three are
+    registered we rebuild the stack on-the-fly so the new layer is live
+    by the time the first ``/cplugapi/v1/*`` request arrives.
     """
     idempotency.install(app)
     request_id.install(app)
     security_middleware.install(app)
+    # Force a rebuild — Starlette caches the live stack on first request,
+    # and ``build_middleware_stack()`` only returns the new stack rather
+    # than installing it. Reassign so the next request picks up the new
+    # layers (idempotency / request_id / security).
+    app.middleware_stack = app.build_middleware_stack()
 
 
 def _do_mount(app: FastAPI, auth_dependency: Optional[Callable]) -> None:

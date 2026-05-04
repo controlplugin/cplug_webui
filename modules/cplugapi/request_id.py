@@ -20,6 +20,7 @@ import threading
 from typing import Optional
 
 from fastapi import FastAPI, Request
+from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
@@ -78,9 +79,14 @@ class CplugapiRequestIdMiddleware(BaseHTTPMiddleware):
 
 
 def install(app: FastAPI) -> None:
-    """Attach the middleware to ``app``. Idempotent + thread-safe."""
+    """Attach the middleware to ``app``. Idempotent + thread-safe.
+
+    Inserts directly into ``user_middleware`` so the install path works
+    post-launch (cplugapi mounts after Gradio has started). Caller must
+    invoke ``app.build_middleware_stack()`` once registration is done.
+    """
     with _install_lock:
         if getattr(app.state, _INSTALL_FLAG, False):
             return
-        app.add_middleware(CplugapiRequestIdMiddleware)
+        app.user_middleware.insert(0, Middleware(CplugapiRequestIdMiddleware))
         setattr(app.state, _INSTALL_FLAG, True)
