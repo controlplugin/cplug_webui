@@ -97,25 +97,11 @@ def test_truncated_file_yields_per_file_error(tmp_path, clean_capabilities):
     assert body["available_arches"] == []
 
 
-def test_pickle_format_gguf(tmp_path, clean_capabilities):
-    """Pickle-format files (.gguf/.ckpt/.pt) are loadable by Forge but
-    not arch-classifiable from outside — surface as unknown, not
-    not_a_checkpoint, so the desktop client still shows them."""
-    bad = tmp_path / "weights.gguf"
-    bad.write_bytes(b"GGUF-blob")
-
-    _stub_checkpoints([_info(str(bad), shorthash="00000000", sha256="0" * 64)])
-    models_disk.reset_cache()
-
-    r = _make_client().get(f"{PREFIX}/models/sd-checkpoints")
-    rec = r.json()["checkpoints"][0]
-    assert rec["arch"] == "unknown"
-    assert rec["error"]["code"] == "pickle_format"
-
-
-def test_pickle_format_ckpt(tmp_path, clean_capabilities):
-    """A .ckpt that Forge has in checkpoints_list must surface as a
-    real (unknown-arch) model, not be marked not_a_checkpoint."""
+def test_pickle_format_ckpt_corrupt(tmp_path, clean_capabilities):
+    """A .ckpt that Forge has in checkpoints_list but isn't valid
+    pickle: must surface as unknown with pickle_parse_failed (we tried
+    and failed), NOT pickle_format (we never tried). Distinct codes
+    so the desktop client can tell the difference."""
     bad = tmp_path / "legacy.ckpt"
     bad.write_bytes(b"PYTORCH-PICKLE")
 
@@ -125,7 +111,47 @@ def test_pickle_format_ckpt(tmp_path, clean_capabilities):
     r = _make_client().get(f"{PREFIX}/models/sd-checkpoints")
     rec = r.json()["checkpoints"][0]
     assert rec["arch"] == "unknown"
-    assert rec["error"]["code"] == "pickle_format"
+    assert rec["error"]["code"] == "pickle_parse_failed"
+
+
+def test_pickle_format_ckpt_classifies_as_sdxl(pickle_factory, clean_capabilities):
+    """A real torch.save .ckpt with SDXL-shaped state-dict keys must
+    classify just like the equivalent .safetensors — pickle path is a
+    drop-in second-stage classifier."""
+    import pytest as _pytest
+    torch = _pytest.importorskip("torch")
+    sdxl_keys = {
+        "model.diffusion_model.input_blocks.0.0.weight": torch.zeros(4, 4, dtype=torch.float16),
+        "conditioner.embedders.1.model.transformer.resblocks.9.mlp.c_proj.bias": torch.zeros(1280, dtype=torch.float16),
+    }
+    p = pickle_factory("legacy_sdxl.ckpt", keys=sdxl_keys)
+
+    _stub_checkpoints([_info(str(p), shorthash="cafebabe00", sha256="c" * 64)])
+    models_disk.reset_cache()
+
+    r = _make_client().get(f"{PREFIX}/models/sd-checkpoints")
+    body = r.json()
+    rec = body["checkpoints"][0]
+    assert rec["arch"] == "sdxl"
+    assert rec["dtype"] == "F16"
+    assert rec["error"] is None
+    assert body["available_arches"] == ["sdxl"]
+
+
+def test_gguf_format_unsupported(tmp_path, clean_capabilities):
+    """GGUF is a separate format we don't classify yet — must surface
+    as unknown with the gguf-specific code (NOT pickle_parse_failed)
+    so the client knows it's a format gap, not a corrupt file."""
+    bad = tmp_path / "weights.gguf"
+    bad.write_bytes(b"GGUF\x00binary-blob")
+
+    _stub_checkpoints([_info(str(bad), shorthash="00000000", sha256="0" * 64)])
+    models_disk.reset_cache()
+
+    r = _make_client().get(f"{PREFIX}/models/sd-checkpoints")
+    rec = r.json()["checkpoints"][0]
+    assert rec["arch"] == "unknown"
+    assert rec["error"]["code"] == "gguf_unsupported"
 
 
 def test_mixed_batch_per_file_resilience(safetensors_factory, tmp_path, clean_capabilities):

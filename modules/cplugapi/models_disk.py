@@ -40,6 +40,7 @@ from typing import Optional, Union
 
 from . import arch as _arch
 from . import header_peek
+from . import pickle_peek
 
 _log = logging.getLogger(__name__)
 
@@ -83,7 +84,7 @@ class ArchInfo:
     error: Optional[dict]
 
 
-# Error codes from :mod:`header_peek` that indicate "couldn't peek, but
+# Error codes from peek modules that indicate "couldn't classify, but
 # the file may still be a valid loadable checkpoint" — Forge has it in
 # ``checkpoints_list`` for a reason. Mapped to :data:`ARCH_UNKNOWN` so
 # the desktop client can still surface the model to users.
@@ -96,6 +97,8 @@ _ARCH_UNKNOWN_CODES = frozenset({
     "permission_denied",
     "invalid_safetensors",
     "pickle_format",
+    "pickle_parse_failed",
+    "gguf_unsupported",
 })
 
 
@@ -166,14 +169,32 @@ def cache_size() -> int:
 
 
 def _peek_and_classify(path: str) -> ArchInfo:
+    """Two-stage classify: safetensors header first, pickle on fallthrough.
+
+    The safetensors path is ~ms; the pickle path is hundreds-of-ms with
+    a torch import. We attempt the cheap one first and only pay the
+    pickle cost when ``header_peek`` reports the file is pickle-format.
+    Any other ``header_peek`` error (corrupt safetensors, missing file,
+    sharded manifest) skips the pickle attempt entirely — pickle_peek
+    couldn't help with those anyway.
+    """
     try:
         peeked = header_peek.peek(path)
     except header_peek.HeaderPeekError as err:
-        return ArchInfo(
-            arch=_arch_for_error_code(err.code),
-            dtype=None,
-            error={"code": err.code, "message": err.message},
-        )
+        if err.code != "pickle_format":
+            return ArchInfo(
+                arch=_arch_for_error_code(err.code),
+                dtype=None,
+                error={"code": err.code, "message": err.message},
+            )
+        try:
+            peeked = pickle_peek.peek(path)
+        except header_peek.HeaderPeekError as pickle_err:
+            return ArchInfo(
+                arch=_arch_for_error_code(pickle_err.code),
+                dtype=None,
+                error={"code": pickle_err.code, "message": pickle_err.message},
+            )
     arch_label = _arch.classify_state_keys(peeked.keys, peeked.metadata)
     dtype = _majority_dtype(peeked.dtypes)
     return ArchInfo(arch=arch_label, dtype=dtype, error=None)

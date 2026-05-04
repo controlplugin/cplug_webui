@@ -95,3 +95,43 @@ def safetensors_factory(tmp_path):
     ) -> Path:
         return make_safetensors_file(keys, metadata, tmp_path, name=name)
     return _factory
+
+
+@pytest.fixture
+def pickle_factory(tmp_path):
+    """Return a callable that writes synthetic pickle-format checkpoints.
+
+    Tests use this to build .ckpt / .pt fixtures that ``pickle_peek``
+    can torch.load and classify. ``keys`` is a flat dict of tensor
+    name → torch.Tensor. ``wrapper`` decides the wire layout:
+
+    - ``"state_dict"`` (default) — saves ``{"state_dict": keys}``,
+      mirroring the A1111-era convention most SD .ckpt files use.
+    - ``"model"`` — Lightning-style ``{"model": keys}``.
+    - ``"bare"`` — saves ``keys`` directly (clean dump).
+
+    The fixture imports torch lazily so the suite still imports in
+    environments where torch is not installed (the offending tests
+    will skip via ``pytest.importorskip`` instead of failing at
+    collection time).
+    """
+    import pytest as _pytest
+
+    def _factory(
+        name: str,
+        keys: dict,
+        wrapper: str = "state_dict",
+    ) -> Path:
+        torch = _pytest.importorskip("torch")
+        if wrapper == "state_dict":
+            obj = {"state_dict": keys}
+        elif wrapper == "model":
+            obj = {"model": keys}
+        elif wrapper == "bare":
+            obj = keys
+        else:
+            raise ValueError(f"unknown wrapper: {wrapper!r}")
+        out = tmp_path / name
+        torch.save(obj, out)
+        return out
+    return _factory

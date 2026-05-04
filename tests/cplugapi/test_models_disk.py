@@ -108,6 +108,27 @@ def test_missing_file_does_not_pollute_cache(tmp_path):
     assert models_disk.cache_size() == 0
 
 
+def test_pickle_path_classifies_through_cache(pickle_factory):
+    """The pickle fallthrough produces a normal cached ArchInfo —
+    same shape as safetensors hits, same cache semantics."""
+    import pytest as _pytest
+    torch = _pytest.importorskip("torch")
+    p = pickle_factory(
+        "legacy_sd15.ckpt",
+        keys={
+            "model.diffusion_model.input_blocks.0.0.weight": torch.zeros(4, 4, dtype=torch.float16),
+            "model.diffusion_model.output_blocks.11.0.skip_connection.weight": torch.zeros(4, 4, dtype=torch.float16),
+            "cond_stage_model.transformer.text_model.embeddings.token_embedding.weight": torch.zeros(4, dtype=torch.float16),
+        },
+    )
+    info1 = models_disk.get_arch_info(str(p))
+    info2 = models_disk.get_arch_info(str(p))
+    assert info1.arch == "sd15"
+    assert info1.dtype == "F16"
+    assert info1.error is None
+    assert info1 is info2  # cache hit returns the same dataclass instance
+
+
 @pytest.mark.parametrize("trial", range(20))
 def test_concurrent_calls_coalesce(safetensors_factory, monkeypatch, trial):
     """8 threads barrier-synced; peek must execute exactly once.
