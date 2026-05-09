@@ -98,11 +98,12 @@ def setup_cplugapi(
         # Demote benign Windows asyncio connection-reset noise to DEBUG.
         # The desktop client routinely closes connections to preempt
         # in-flight gens; without this filter every preempt logs a
-        # WinError-10054 traceback that drowns out real signal. Pass
-        # ``app`` so installation defers to the Starlette startup event
-        # — uvicorn's running loop isn't reachable from this sync
-        # context (we're called during route mounting).
-        asyncio_filter.install(app)
+        # WinError-10054 traceback that drowns out real signal.
+        # Implementation is a logging-layer filter on the ``asyncio``
+        # logger — global state, no per-loop wiring, robust to mount
+        # ordering (Forge mounts our router AFTER uvicorn's loop is
+        # already serving, so a per-loop hook would never fire).
+        asyncio_filter.install()
         _install_middlewares(app)
         _do_mount(app, auth_dependency)
         setattr(app.state, _MOUNT_FLAG, True)

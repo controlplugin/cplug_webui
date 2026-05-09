@@ -8,7 +8,7 @@ transport closes. That callback tries ``self._sock.shutdown(SHUT_RDWR)``
 to drain any pending data — but if the peer already sent RST (a hard
 forcible close, common when the desktop ControlPlugin client preempts
 an in-flight generation for a fresh sketch stroke), the kernel returns
-``WinError 10054`` (ConnectionResetError). Python's default asyncio
+``WinError 10054`` (ConnectionResetError). The default asyncio
 exception handler logs this loudly as ``Exception in callback…`` even
 though there is nothing to do — the connection is already gone.
 
@@ -19,20 +19,28 @@ these tracebacks dominate the log and drown out real signal.
 
 Mitigation
 ----------
-Wrap the running loop's exception handler with a filter that
-recognises this specific signature (ConnectionResetError raised
-inside ``_call_connection_lost``) and either silences it or demotes
-it to DEBUG. Anything we don't recognise goes through the original
-handler unchanged so genuine errors stay visible.
+asyncio's default exception handler emits via
+``logging.getLogger("asyncio").error(...)``. We attach a
+:class:`logging.Filter` to that logger and drop records whose
+``exc_info`` is a ``ConnectionResetError`` raised inside
+``_call_connection_lost``.
 
-The filter is Windows-only (other platforms use SelectorEventLoop /
-KqueueEventLoop and don't surface this particular noise) and idempotent
-(calling install twice is a no-op).
+Why a logging filter rather than ``loop.set_exception_handler``:
+Forge mounts our router AFTER uvicorn's loop is already serving, so a
+``startup`` event hook never fires. ``asyncio.get_event_loop()`` from
+our sync mount context returns a throwaway loop, not the serving one.
+The logger is global state — installation is a dict update, no loop
+coordination needed, and any loop that uses the default handler routes
+through the same logger. Bullet-proof against the mount-ordering
+problem.
+
+Windows-only and idempotent.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import threading
 
@@ -45,118 +53,91 @@ except ImportError:
 
 _INSTALL_LOCK = threading.Lock()
 _INSTALLED = False
-# Marker added to loops we've already wrapped so a second install attempt
-# (test reuse, webui reload) doesn't double-wrap. Using a ``setattr`` on
-# the loop is robust across loop instances; a module-level flag would
-# miss cases where uvicorn replaces the loop on reload.
-_LOOP_WRAPPED_ATTR = "_cplug_asyncio_filter_installed"
+
+# Substring that uniquely identifies the proactor cleanup path. Match
+# against the message rather than importing the private class — the
+# import path differs across asyncio versions, and the message text
+# is stable (``Exception in callback _ProactorBasePipeTransport.
+# _call_connection_lost()``).
+_PROACTOR_MESSAGE_MARKER = "_ProactorBasePipeTransport._call_connection_lost"
+_HANDLE_REPR_MARKER = re.compile(r"_call_connection_lost")
 
 
-def _is_proactor_connection_reset(context: dict) -> bool:
-    """True for the specific Windows asyncio cleanup race we want to mute.
+class _ProactorResetFilter(logging.Filter):
+    """Drop the specific Windows asyncio cleanup race we want to mute.
 
-    Two signals must both match:
-    - The exception is a ``ConnectionResetError`` (or its WinError-10054
-      variant — they share the same Python type).
-    - The handle's repr names ``_call_connection_lost`` (the
-      ProactorBasePipeTransport cleanup path). We match on repr rather
-      than importing the private class because the import path differs
-      across asyncio versions; repr matching is stable enough for a
-      defensive filter.
-    """
-    exc = context.get("exception")
-    if not isinstance(exc, ConnectionResetError):
-        return False
-    handle = context.get("handle")
-    if handle is None:
-        return False
-    return "_call_connection_lost" in repr(handle)
+    Two signals must both match before the record is suppressed:
 
+    - ``record.exc_info`` is (or wraps) a ``ConnectionResetError``.
+    - The message names ``_call_connection_lost`` (the
+      ``ProactorBasePipeTransport`` cleanup path).
 
-def _make_filtered_handler(original):
-    """Build an exception handler that swallows the proactor noise and
-    delegates everything else to ``original``.
-
-    ``original`` may be ``None`` (loop has no custom handler) — in that
-    case unrecognised exceptions go through ``loop.default_exception_handler``.
+    Anything else passes through untouched so genuine asyncio errors
+    (real ConnectionResetError elsewhere, RuntimeErrors, etc.) stay
+    visible at their original level.
     """
 
-    def handler(loop, context):
-        if _is_proactor_connection_reset(context):
+    def filter(self, record: logging.LogRecord) -> bool:
+        exc_info = record.exc_info
+        if not exc_info or not isinstance(exc_info, tuple) or len(exc_info) < 2:
+            return True
+        exc = exc_info[1]
+        if not isinstance(exc, ConnectionResetError):
+            return True
+
+        # Cheap content sniff: the default handler builds the message
+        # by joining the context dict's values, so the marker shows up
+        # in either ``record.msg`` or ``record.getMessage()``. We also
+        # accept a handle-repr marker for handlers that format
+        # differently.
+        message = record.getMessage()
+        if _PROACTOR_MESSAGE_MARKER in message or _HANDLE_REPR_MARKER.search(message):
             # DEBUG so verbose-mode operators can still inspect them,
             # but the default INFO console stays clean.
             _log.debug(
                 "asyncio cleanup ConnectionResetError suppressed: %s",
-                context.get("message", ""),
+                message.splitlines()[0] if message else "<no message>",
             )
-            return
-        if original is not None:
-            original(loop, context)
-        else:
-            loop.default_exception_handler(context)
+            return False
 
-    return handler
+        return True
 
 
-def _install_on_running_loop() -> None:
-    """Wrap the running loop's exception handler. Idempotent.
+_filter_instance = _ProactorResetFilter()
 
-    Must be called from inside a running loop (either coroutine context
-    or Starlette's startup hook) — :func:`install` arranges that.
+
+def install(app=None) -> None:
+    """Attach the proactor-noise filter to the ``asyncio`` logger.
+
+    ``app`` is accepted but ignored — kept for backward compatibility
+    with the previous loop-handler-based API. Installation is global
+    logger state; no per-app or per-loop wiring required.
+
+    Idempotent: subsequent calls are no-ops. Windows-only — other
+    platforms don't surface this particular cleanup race.
     """
     global _INSTALLED
     if sys.platform != "win32":
         return
 
-    import asyncio
-
     with _INSTALL_LOCK:
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # Not in a running loop. Caller is misusing the API; silent
-            # rather than raising so a bad call site can't take the app
-            # down.
+        if _INSTALLED:
             return
-
-        if getattr(loop, _LOOP_WRAPPED_ATTR, False):
-            return
-
-        original = loop.get_exception_handler()
-        loop.set_exception_handler(_make_filtered_handler(original))
-        setattr(loop, _LOOP_WRAPPED_ATTR, True)
+        logging.getLogger("asyncio").addFilter(_filter_instance)
         _INSTALLED = True
-
-
-def install(app=None) -> None:
-    """Schedule the filter to install on the app's running event loop.
-
-    Why deferred: ``setup_cplugapi`` runs during route mounting, which
-    is a sync context BEFORE uvicorn boots its loop. ``asyncio.
-    get_event_loop()`` from there returns a freshly-created throwaway
-    loop in Python 3.12+ — wrapping its handler does nothing because
-    uvicorn binds a different loop at startup. We register a startup
-    event handler instead, so installation runs inside the actual
-    serving loop and ``asyncio.get_running_loop()`` is well-defined.
-
-    Windows-only — other platforms don't surface the proactor cleanup
-    race. ``app=None`` is accepted for the test path that wants to
-    drive ``_install_on_running_loop`` directly from a coroutine.
-    """
-    if sys.platform != "win32":
-        return
-
-    if app is None:
-        # Test path: caller (a coroutine) drives installation directly.
-        _install_on_running_loop()
-        return
-
-    async def _on_startup() -> None:
-        _install_on_running_loop()
-
-    app.add_event_handler("startup", _on_startup)
 
 
 def is_installed() -> bool:
     """Test-only: surface whether the filter has been wired."""
     return _INSTALLED
+
+
+def _uninstall_for_tests() -> None:
+    """Remove the filter — exists so tests can reset module state.
+
+    Not part of the public API; production has no use for unwiring.
+    """
+    global _INSTALLED
+    with _INSTALL_LOCK:
+        logging.getLogger("asyncio").removeFilter(_filter_instance)
+        _INSTALLED = False
