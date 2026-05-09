@@ -65,6 +65,17 @@ class CplugapiRequestIdMiddleware(BaseHTTPMiddleware):
     ``/sdapi/v1/*`` surface stays byte-identical with upstream.
     """
 
+    async def __call__(self, scope, receive, send):
+        # See ``access_log.CplugapiAccessLogMiddleware.__call__`` for the
+        # rationale: bypass ``BaseHTTPMiddleware``'s response-buffering
+        # wrapper on paths we don't care about, so non-cplugapi
+        # streaming endpoints (Gradio long-poll) aren't affected by
+        # Starlette issue 1438.
+        if scope["type"] != "http" or not scope.get("path", "").startswith(_PREFIX):
+            await self.app(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
+
     async def dispatch(self, request: Request, call_next):
         if not request.url.path.startswith(_PREFIX):
             return await call_next(request)

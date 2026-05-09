@@ -183,6 +183,17 @@ def _replay(entry: _CacheEntry) -> Response:
 class CplugapiIdempotencyMiddleware(BaseHTTPMiddleware):
     """Cache + replay responses keyed on ``Idempotency-Key``."""
 
+    async def __call__(self, scope, receive, send):
+        # Bypass ``BaseHTTPMiddleware``'s response-buffering wrapper on
+        # paths we never cache. The wrapper interferes with downstream
+        # ``StreamingResponse`` flows (Gradio long-poll endpoints) per
+        # Starlette issue 1438 — pure passthrough for non-cplugapi
+        # paths preserves the upstream surface and sidesteps the bug.
+        if scope["type"] != "http" or not scope.get("path", "").startswith(_PREFIX):
+            await self.app(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
+
     async def dispatch(self, request: Request, call_next):
         if not request.url.path.startswith(_PREFIX):
             return await call_next(request)

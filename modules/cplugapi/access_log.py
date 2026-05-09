@@ -102,11 +102,30 @@ class CplugapiAccessLogMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
         self._enabled = enabled
 
+    async def __call__(self, scope, receive, send):
+        # Bypass ``BaseHTTPMiddleware``'s anyio-task-group wrapper on
+        # paths we don't measure. The wrapper buffers responses through
+        # a channel, which deadlocks / mis-attributes errors when a
+        # downstream endpoint returns a ``StreamingResponse`` whose
+        # generator raises (Gradio's long-poll endpoints do this on
+        # client disconnect — Starlette issue 1438). Pure passthrough
+        # for non-cplugapi paths preserves byte-identity AND sidesteps
+        # the bug. Only paths under ``/cplugapi/v1/`` go through the
+        # wrapping machinery, and those endpoints don't stream.
+        if scope["type"] != "http" or not scope.get("path", "").startswith(_PREFIX):
+            await self.app(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
+
     async def dispatch(
         self,
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
+        # By the time dispatch runs we've already filtered to cplugapi
+        # paths via __call__, so the prefix check here would be
+        # redundant. Kept as a defensive guard for direct unit tests
+        # that bypass __call__.
         if not request.url.path.startswith(_PREFIX):
             return await call_next(request)
 

@@ -172,6 +172,20 @@ class CplugapiSecurityMiddleware(BaseHTTPMiddleware):
             else _parse_int_env(ENV_MAX_BODY_BYTES, DEFAULT_MAX_BODY_BYTES)
         )
 
+    async def __call__(self, scope, receive, send):
+        # Bypass ``BaseHTTPMiddleware``'s anyio task-group wrapper on
+        # paths outside the protected prefix. The wrapper buffers
+        # responses through a channel that mis-attributes errors when
+        # an inner ``StreamingResponse`` raises mid-stream (Gradio's
+        # long-poll endpoints, Starlette issue 1438). Pure passthrough
+        # for non-cplugapi paths preserves the upstream response shape
+        # exactly AND sidesteps the bug — only requests we genuinely
+        # need to inspect go through the wrapping machinery.
+        if scope["type"] != "http" or not scope.get("path", "").startswith(PROTECTED_PREFIX):
+            await self.app(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
+
     async def dispatch(
         self,
         request: Request,

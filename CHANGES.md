@@ -7,6 +7,27 @@ grouped by **Added / Changed / Fixed / Removed**.
 
 ## Unreleased
 
+### Fixed — `RuntimeError: No response returned` on Gradio streaming paths
+
+All four cplugapi middlewares (access_log, request_id, security,
+idempotency) inherit from Starlette's `BaseHTTPMiddleware`, which
+wraps the entire request lifecycle through anyio task groups that
+buffer the response via a memory-channel. When a downstream endpoint
+returned a `StreamingResponse` whose generator raised mid-stream
+(typical for Gradio's long-poll endpoints on client disconnect), the
+channel-based plumbing converted the real exception into a spurious
+`RuntimeError: No response returned`, masking the actual cause and
+firing through the entire middleware chain even on paths outside
+`/cplugapi/v1/*`. Documented at encode/starlette#1438.
+
+Each middleware now overrides `__call__` to bypass the wrapper for
+non-cplugapi paths — pure passthrough via `await self.app(scope,
+receive, send)`, which leaves the response shape identical to
+"middleware not installed". The `dispatch` method is preserved for
+in-prefix requests where we genuinely need to inspect / time / cache
+the response. (`modules/cplugapi/access_log.py`,
+`request_id.py`, `security_middleware.py`, `idempotency.py`)
+
 ### Fixed — `apply_token_merging` cloned the UnetPatcher every gen
 
 Forge's design has `TomePatcher.patch` deep-clone the UnetPatcher
