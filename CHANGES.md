@@ -9,11 +9,20 @@ grouped by **Added / Changed / Fixed / Removed**.
 
 ### Added — auto-preempt for `/sdapi/v1/{txt2img,img2img}`
 
-Pure-ASGI middleware that fires `shared.state.interrupt()` and drains
-the pending queue **before forwarding** incoming gen requests to
-Forge's handler. Cancels the running gen + clears queued gens so
-rapid sketch strokes from the desktop client stop stacking up
-behind one another.
+Two-stage mechanism. **Pre-handler middleware**: pure-ASGI, fires
+`shared.state.interrupt()` and drains pending tasks into
+`cancelled_tasks` before forwarding incoming gen requests. **Late-
+abort hook on `process_images_inner`**: re-arms `state.interrupted =
+True` at entry if the active task is in `cancelled_tasks` —
+necessary because Forge's `state.begin()` clears the interrupt flag
+inside the queue_lock critical section, so without this hook
+queued-but-cancelled gens run to completion despite the registry
+marker.
+
+Result: rapid sketch strokes from the desktop client stop stacking
+up behind one another. Each preempted gen exits on its first
+sample-step interrupt-check (~100 ms wall) instead of running 13+
+diffusion steps.
 
 Mode-driven via `CPLUG_PREEMPT_MODE`:
 - `always` (fork default) — every gen request preempts. Best for

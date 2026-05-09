@@ -266,3 +266,83 @@ def register_capabilities() -> None:
         return
     capabilities.register("sdapi/preempt")
     capabilities.register(f"sdapi/preempt-{mode}")
+
+
+# ---------------------------------------------------------------------------
+# Late-abort hook on process_images_inner
+# ---------------------------------------------------------------------------
+#
+# The pre-handler middleware above is necessary but not sufficient. Forge's
+# API handler structure is:
+#
+#     add_task_to_queue(task_id)         # joins pending_tasks
+#     with self.queue_lock:               # blocks if held
+#         shared.state.begin(...)         # ← RESETS self.interrupted = False
+#         start_task(task_id)             # pops from pending, sets current
+#         processed = process_images(p)   # actual gen
+#         finish_task(task_id)
+#
+# Multiple in-flight strokes:
+#  - Each stroke's middleware fires interrupt() and drains pending_tasks.
+#    The drain marks every previously-queued task in ``cancelled_tasks``.
+#  - But once a queued gen's handler acquires queue_lock and calls
+#    ``state.begin()``, the interrupt flag is cleared. The gen then runs
+#    to completion despite being marked cancelled — ``cancelled_tasks`` is
+#    only a status-poke marker, it doesn't gate execution.
+#
+# Mitigation: wrap ``process_images_inner`` to re-arm ``state.interrupted``
+# at entry if the active task (``progress.current_task`` — already set by
+# ``start_task`` by the time we run) is in ``cancelled_tasks``. The next
+# sample-step check exits immediately, ``process_images`` returns a
+# near-empty ``Processed``, the handler completes normally and the client
+# sees a fast empty response. Each preempted gen now spends ~100 ms on
+# queue_lock contention + sampler init instead of running 13+ steps.
+
+
+_HOOK_INSTALL_FLAG = "_cplug_auto_preempt_hook_installed"
+_hook_install_lock = threading.Lock()
+
+
+def install_hooks() -> None:
+    """Wrap ``modules.processing.process_images_inner`` with the late-abort
+    check. Idempotent — flag stamped on the upstream module so a webui
+    reload doesn't double-wrap.
+
+    Must run AFTER :func:`gen_timing.install_hooks` so the abort path is
+    measured by gen_timing's wall-clock counter (preempted gens show up
+    with very small ``total_ms`` and ``error=InterruptedException`` if
+    Forge raises, or just empty stages if it returns cleanly).
+    """
+    with _hook_install_lock:
+        try:
+            from modules import processing as _proc
+        except ImportError:
+            return
+        if getattr(_proc, _HOOK_INSTALL_FLAG, False):
+            return
+        setattr(_proc, _HOOK_INSTALL_FLAG, True)
+
+        original_process = _proc.process_images_inner
+
+        def wrapped_process_images_inner(p, *args, **kwargs):
+            # Late check: if the current task was marked cancelled before
+            # we got the lock, re-arm the interrupt flag that
+            # ``state.begin()`` just cleared. The sampler exits at its
+            # first interrupt-check (typically before step 0 of the
+            # actual diffusion loop).
+            try:
+                from modules import progress, shared
+                from . import cancelled_tasks
+            except Exception:
+                return original_process(p, *args, **kwargs)
+
+            current = getattr(progress, "current_task", None)
+            if current and cancelled_tasks.has(current):
+                try:
+                    shared.state.interrupted = True
+                except Exception:
+                    pass
+                _log.info("late-abort: task %s preempted before sampling", current)
+            return original_process(p, *args, **kwargs)
+
+        _proc.process_images_inner = wrapped_process_images_inner

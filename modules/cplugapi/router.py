@@ -89,6 +89,12 @@ def setup_cplugapi(
 
         runtime.apply_runtime_tweaks()
         gen_timing.install_hooks()
+        # Late-abort hook for queued-but-preempted gens. Must run AFTER
+        # gen_timing.install_hooks so it sits on the OUTSIDE of the
+        # gen_timing wrap — the early-abort path will surface as a fast
+        # short total_ms in the gen_timing log, useful as a diagnostic
+        # for "how many strokes were preempted before sampling started".
+        auto_preempt.install_hooks()
         # Demote benign Windows asyncio connection-reset noise to DEBUG.
         # The desktop client routinely closes connections to preempt
         # in-flight gens; without this filter every preempt logs a

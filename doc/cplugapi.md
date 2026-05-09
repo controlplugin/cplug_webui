@@ -94,6 +94,17 @@ Mode-driven via `CPLUG_PREEMPT_MODE`:
 | `header` | Only when `X-Cplug-Preempt: 1` (or `true` / `yes` / `on`) is on the request | Per-request opt-in; client can mark previews as preemptive and final renders as terminal |
 | `off` | Pure passthrough, never preempts | Use when the fork default conflicts with another workflow; equivalent to upstream behavior |
 
+The mechanism is two-stage: the pre-handler middleware fires
+`shared.state.interrupt()` and drains queued tasks into
+`cancelled_tasks`. Then a wrap on `process_images_inner` re-arms
+`state.interrupted = True` at entry if the active task is in
+`cancelled_tasks` — necessary because Forge's per-handler
+`state.begin()` clears the interrupt flag inside the queue_lock
+critical section. Without this re-arm, queued-but-cancelled gens
+run to completion despite the marker. With it, they exit on their
+first sample-step interrupt-check (~100 ms total: queue_lock wait +
+sampler init + abort).
+
 Read once at install time — operators tweaking the mode need to
 restart the webui. Invalid values fall back to the default with a
 warning so typos don't silently disable the feature.

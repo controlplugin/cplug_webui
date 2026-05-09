@@ -237,3 +237,106 @@ def test_off_mode_advertises_no_preempt_capability(progress_stub, clean_capabili
     app = _build_app_with_gen_routes(MODE_OFF)
     caps = TestClient(app).get(f"{PREFIX}/health").json()["capabilities"]
     assert not any(c.startswith("sdapi/preempt") for c in caps)
+
+
+# ---------------------------------------------------------------------------
+# Late-abort hook (process_images_inner wrap)
+# ---------------------------------------------------------------------------
+
+
+def _install_processing_stub(monkeypatch):
+    """Replace ``modules.processing`` with a callable stub. Returns the
+    stub + a counter dict the test can read to verify whether
+    process_images_inner was actually run vs short-circuited."""
+    import sys
+    import types
+
+    stub = types.ModuleType("modules.processing")
+    counters = {"called": 0, "interrupted_at_entry": None}
+
+    def _process(p):
+        counters["called"] += 1
+        # Capture the interrupted flag AT ENTRY of the wrapped function.
+        # If the late-abort hook fired, this should be True.
+        from modules import shared
+        counters["interrupted_at_entry"] = shared.state.interrupted
+        return "result"
+
+    stub.process_images_inner = _process
+    stub.decode_latent_batch = lambda *a, **k: None
+    monkeypatch.setitem(sys.modules, "modules.processing", stub)
+
+    # Force a fresh hook install on the new stub.
+    from modules.cplugapi import auto_preempt as ap, gen_timing
+    for flag in (ap._HOOK_INSTALL_FLAG, gen_timing._INSTALL_FLAG):
+        if hasattr(stub, flag):
+            delattr(stub, flag)
+    gen_timing.install_hooks()
+    ap.install_hooks()
+
+    return stub, counters
+
+
+def test_late_abort_fires_when_task_in_cancelled_registry(
+    progress_stub, shared_stub, clean_capabilities, monkeypatch,
+):
+    """A queued gen that was marked cancelled by an earlier preempt
+    must have ``state.interrupted = True`` re-set at process_images_inner
+    entry — Forge's ``state.begin()`` cleared it inside queue_lock."""
+    stub, counters = _install_processing_stub(monkeypatch)
+    progress_stub.current_task = "task(cancelled)"
+    cancelled_tasks.add("task(cancelled)")
+
+    # Simulate Forge's flow: state.begin() resets interrupted, then
+    # the wrapped process_images_inner runs.
+    shared_stub.state.interrupted = False  # what state.begin() does
+    stub.process_images_inner("p")
+
+    assert counters["called"] == 1
+    # Hook re-armed the flag before the original ran.
+    assert counters["interrupted_at_entry"] is True
+
+
+def test_late_abort_silent_for_normal_task(
+    progress_stub, shared_stub, clean_capabilities, monkeypatch,
+):
+    """A normal (non-cancelled) gen must NOT have the interrupt flag
+    set — that would abort every gen."""
+    stub, counters = _install_processing_stub(monkeypatch)
+    progress_stub.current_task = "task(normal)"
+    # cancelled_tasks empty by autouse fixture
+
+    shared_stub.state.interrupted = False
+    stub.process_images_inner("p")
+
+    assert counters["called"] == 1
+    assert counters["interrupted_at_entry"] is False
+
+
+def test_late_abort_safe_when_no_current_task(
+    progress_stub, shared_stub, clean_capabilities, monkeypatch,
+):
+    """Defensive: if ``current_task`` is None at entry (test/edge case),
+    the hook must not crash and must not flip the interrupt flag."""
+    stub, counters = _install_processing_stub(monkeypatch)
+    progress_stub.current_task = None
+
+    shared_stub.state.interrupted = False
+    stub.process_images_inner("p")
+
+    assert counters["called"] == 1
+    assert counters["interrupted_at_entry"] is False
+
+
+def test_install_hooks_idempotent(monkeypatch):
+    """Calling install_hooks twice must not double-wrap. Otherwise
+    the late-abort logic would run twice per gen, which is harmless
+    but wasteful."""
+    from modules.cplugapi import auto_preempt as ap
+
+    stub, counters = _install_processing_stub(monkeypatch)
+    ap.install_hooks()  # already installed in fixture; this is a 2nd call
+    ap.install_hooks()  # 3rd
+
+    stub.process_images_inner("p")
+    assert counters["called"] == 1
