@@ -7,6 +7,23 @@ grouped by **Added / Changed / Fixed / Removed**.
 
 ## Unreleased
 
+### Added — per-request access log for `/cplugapi/v1/*`
+
+One structured line per request emitted to the `cplugapi.access`
+logger at INFO level. Captures end-to-end server-side wall time
+(`dur_ms`), method/path/status, request and response Content-Length,
+the `X-Request-Id` value (so client and server logs join cleanly),
+and a `replayed=1` flag for idempotency-cache hits so cached responses
+are distinguishable from real handler executions. Outside
+`/cplugapi/v1/*` the middleware is a straight pass-through — preserves
+the byte-identity invariant for `/sdapi/v1/*`. Disable per-deployment
+via `CPLUG_ACCESS_LOG=0`. Capability string: `request-log`.
+
+Diagnostic intent: when the desktop client reports slow workflows,
+this log lets operators triage server-side vs network-vs-client by
+comparing the client's measured RTT against the server's `dur_ms`.
+(`modules/cplugapi/access_log.py`)
+
 ### Added — pickle-format checkpoint classification
 
 `.ckpt` / `.pt` / `.pth` / `.bin` files now go through a second-stage

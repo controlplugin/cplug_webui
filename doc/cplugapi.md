@@ -48,6 +48,35 @@ the prefix the middleware is a no-op so the byte-identity invariant on
 Native clients (no `Origin` header) and `file://` pages (`Origin: null`)
 are accepted; loopback browsers are accepted by regex match.
 
+## Access log
+
+One structured line per `/cplugapi/v1/*` request is emitted to the
+`cplugapi.access` Python logger at INFO level. Format:
+
+```text
+GET /cplugapi/v1/health status=200 dur_ms=2.345 in=-1 out=145 req_id=req_abc
+```
+
+Fields (also exposed via the `LogRecord.extra` dict for JSON
+formatters):
+
+| Field | Meaning |
+|---|---|
+| `method` / `path` / `status` | HTTP verb, route, status code |
+| `dur_ms` | Wall-clock spent server-side (everything inside our middleware chain — security + auth + handler). What the client measures minus this is network or client-side. |
+| `in` / `out` | Request and response `Content-Length`, or `-1` if not declared |
+| `req_id` | Same value as the `X-Request-Id` header — joins to client logs |
+| `replayed=1` | Idempotency cache replay, not a real handler execution |
+| `error=<ExceptionName>` | Handler raised before producing a response |
+
+The middleware sits outermost in the chain by design — its `dur_ms`
+spans every other cplugapi middleware plus the handler. Outside the
+prefix it is a straight pass-through (zero log lines, zero overhead).
+
+Set `CPLUG_ACCESS_LOG=0` (or `false`/`no`/`off`) to disable emission;
+the middleware still installs but skips the format step. Capability
+string: `request-log`.
+
 ## Cross-cutting headers
 
 | Header | Direction | Purpose |
@@ -282,6 +311,7 @@ queue
 models/architecture
 models/disk-scan
 models/architectures-available
+request-log
 ```
 
 ## Environment variables
@@ -294,6 +324,7 @@ models/architectures-available
 | `CPLUG_IDEMPOTENCY_MAX` | `1024` | idempotency cache |
 | `CPLUG_IDEMPOTENCY_TTL_S` | `86400` (24 h) | idempotency cache |
 | `CPLUG_MODELS_CACHE_MAX` | `4096` | model arch cache |
+| `CPLUG_ACCESS_LOG` | enabled | per-request access log (set `0` to disable) |
 | `CPLUG_FORK_COMMIT` | `unknown` | `__version__` (CI) |
 | `CPLUG_UPSTREAM_COMMIT` | `unknown` | `__version__` (CI) |
 | `CPLUG_FORK_BUILD_DATE` | process start (UTC ISO-8601) | `__version__` (CI) |
