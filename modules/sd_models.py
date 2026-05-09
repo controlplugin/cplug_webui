@@ -296,9 +296,46 @@ def list_loaded_weights():
 
 def apply_token_merging(sd_model, token_merging_ratio):
     if token_merging_ratio > 0.0:
+        # cplug fork: cache the ToMe-patched UnetPatcher across gens.
+        #
+        # Why this exists: ``TomePatcher.patch`` does ``model.clone()``
+        # + attaches attn1 patches, returning a NEW UnetPatcher. The
+        # fresh clone never ``__eq__``s the patcher already in
+        # ``current_loaded_models``, so Forge's
+        # ``load_models_gpu`` (memory_management.py:626-650) takes the
+        # ``is_clone`` branch on EVERY generation: pop the previously-
+        # loaded patcher, ``detach(unpatch_all=False)``, then re-load
+        # the new clone. This logs ``Requested to load KModel`` and
+        # costs ~0.7s per gen for the patch-rebind even when nothing
+        # else changed (no weight transfer; just patcher state walk).
+        #
+        # Vanilla A1111 monkey-patched ToMe in place — same effect, no
+        # clone, no reload. We can't undo Forge's design but we can
+        # cache the patched clone keyed on the LoRA-baseline patcher
+        # identity + ratio. Cache hit → assign the cached patcher
+        # back onto ``forge_objects.unet`` so the next ``__eq__``
+        # check in ``load_models_gpu`` matches and the unload/reload
+        # path is skipped entirely.
+        #
+        # Invalidation: when LoRA changes (or the model is swapped),
+        # ``forge_objects_after_applying_lora.unet`` is rebuilt with
+        # a new ``id()``, the cache key misses, we patch fresh.
+        baseline_unet = sd_model.forge_objects.unet
+        baseline_id = id(baseline_unet)
+
+        cache = getattr(sd_model, "_cplug_tome_cache", None)
+        if cache is not None:
+            cached_baseline_id, cached_ratio, cached_patched = cache
+            if cached_baseline_id == baseline_id and cached_ratio == token_merging_ratio:
+                # Same baseline, same ratio — cached patcher is still
+                # in ``current_loaded_models``, reuse it directly.
+                sd_model.forge_objects.unet = cached_patched
+                return
+
         from backend.misc.tomesd import TomePatcher
 
-        sd_model.forge_objects.unet = TomePatcher.patch(model=sd_model.forge_objects.unet, ratio=token_merging_ratio)
+        sd_model.forge_objects.unet = TomePatcher.patch(model=baseline_unet, ratio=token_merging_ratio)
+        sd_model._cplug_tome_cache = (baseline_id, token_merging_ratio, sd_model.forge_objects.unet)
         print(f"token_merging_ratio = {token_merging_ratio}")
 
     if opts.scaling_factor > 1.0 and sd_model.model_config.model_type.name == "EPS":
