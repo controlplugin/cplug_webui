@@ -30,6 +30,7 @@ from . import (
     sdapi_observer,
     security_middleware,
     session_cancel,
+    session_preempt,
     version_endpoint,
 )
 
@@ -49,6 +50,7 @@ def _register_capabilities() -> None:
     capabilities.register("version")
     capabilities.register("session/cancel")
     capabilities.register("forge/preset")
+    session_preempt.register_capabilities()
     # Audit 02 — Phase A/B observability + hardening.
     security_middleware.register_capabilities()
     idempotency.register_capabilities()
@@ -148,6 +150,7 @@ def _do_mount(app: FastAPI, auth_dependency: Optional[Callable]) -> None:
     health.attach(private)
     version_endpoint.attach(private)
     session_cancel.attach(private)
+    session_preempt.attach(private)
     preset.attach(private)
     livez_readyz.attach(private)
     queue_endpoint.attach(private)

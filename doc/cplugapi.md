@@ -213,6 +213,34 @@ State enum: `cancelled`, `already_cancelled`, `already_completed`,
 
 Capability: `session/cancel`.
 
+### `POST /session/preempt` — cancel whatever is running
+
+```
+POST /cplugapi/v1/session/preempt[?clear_pending=1]
+→ 200
+{
+  "preempted_task_id": "task(txt2img-XXXXXXX)" | null,
+  "was_running": true | false,
+  "cleared_pending": <int>
+}
+```
+
+The "cancel-without-knowing-the-id" companion to `/session/cancel/{id_task}`.
+Calls `shared.state.interrupt()` if anything is running, marks the
+cancelled task in the registry so late status pokes return
+`"already_cancelled"`. With `?clear_pending=1`, also drains the
+pending queue (each entry pops, gets recorded). Idempotent.
+
+Recommended client pattern for sketch workflows:
+
+```rust
+// fire-and-forget the preempt; immediately submit the new gen
+let _ = http.post("/cplugapi/v1/session/preempt").await;
+let img = http.post("/sdapi/v1/txt2img", payload).await?;
+```
+
+Capability: `session/preempt`.
+
 ### `POST /forge/preset/{name}` — atomic toggle bundle
 
 Flips a coordinated set of `shared.opts` toggles that the live-sketching
@@ -364,6 +392,7 @@ identify
 health
 version
 session/cancel
+session/preempt
 forge/preset
 security/csrf-host-bodylimit
 idempotency

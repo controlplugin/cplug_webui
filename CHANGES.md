@@ -7,6 +7,21 @@ grouped by **Added / Changed / Fixed / Removed**.
 
 ## Unreleased
 
+### Added — `POST /cplugapi/v1/session/preempt`
+
+Cancel-without-knowing-the-id companion to `/session/cancel/{id_task}`.
+Fires `shared.state.interrupt()` if a task is running, records it in
+`cancelled_tasks` (so late status pokes return `"already_cancelled"`),
+and optionally drains the pending queue with `?clear_pending=1`.
+Returns the cancelled task id, a `was_running` flag, and the
+pending-drain count for diagnostic clarity.
+
+Designed for the sketch-mode pipelining pattern: client fires preempt
++ next gen back-to-back, the new `/sdapi/v1/txt2img` blocks ~1
+sample step on Forge's `queue_lock` while the cancelled gen exits,
+then proceeds normally. Capability: `session/preempt`.
+(`modules/cplugapi/session_preempt.py`)
+
 ### Fixed — Windows asyncio `ConnectionResetError` traceback spam
 
 asyncio's Windows ``ProactorEventLoop`` calls

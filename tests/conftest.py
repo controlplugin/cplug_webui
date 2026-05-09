@@ -72,9 +72,24 @@ def progress_stub():
 
 @pytest.fixture
 def shared_stub():
-    """Reset and return the ``modules.shared`` stub for this test."""
+    """Reset and return the ``modules.shared`` stub for this test.
+
+    Replaces ``state`` with a fresh ``_State`` instance rather than
+    just resetting the counter — the previous test may have monkey-
+    patched ``state.interrupt`` (e.g., test_session_cancel's
+    interrupt-raises path) and only resetting the counter would leave
+    that override in place to poison subsequent tests.
+    """
     stub = sys.modules["modules.shared"]
-    stub.state.interrupt_called = 0
+
+    class _State:
+        def __init__(self) -> None:
+            self.interrupt_called = 0
+
+        def interrupt(self) -> None:
+            self.interrupt_called += 1
+
+    stub.state = _State()  # type: ignore[attr-defined]
     return stub
 
 
