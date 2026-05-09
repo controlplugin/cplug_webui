@@ -98,34 +98,25 @@ def _make_filtered_handler(original):
     return handler
 
 
-def install() -> None:
-    """Wrap the current event loop's exception handler. Windows only.
+def _install_on_running_loop() -> None:
+    """Wrap the running loop's exception handler. Idempotent.
 
-    Best-effort: if no loop is reachable (called too early, or platform
-    doesn't have one), the function is a silent no-op rather than
-    raising. Idempotent across calls and across loop replacements.
+    Must be called from inside a running loop (either coroutine context
+    or Starlette's startup hook) — :func:`install` arranges that.
     """
     global _INSTALLED
     if sys.platform != "win32":
         return
 
     import asyncio
-    import warnings
 
     with _INSTALL_LOCK:
         try:
-            # ``get_event_loop`` is the right primitive here — we're not
-            # inside a running coroutine but want the loop the FastAPI
-            # app will eventually run on. ``get_running_loop`` would
-            # require coroutine context. Python 3.12+ emits a
-            # DeprecationWarning when called outside a running loop;
-            # the call still works for our use case (uvicorn binds to
-            # the policy's loop) so silence the noise.
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=DeprecationWarning)
-                loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
         except RuntimeError:
-            # No loop reachable. Caller can retry later.
+            # Not in a running loop. Caller is misusing the API; silent
+            # rather than raising so a bad call site can't take the app
+            # down.
             return
 
         if getattr(loop, _LOOP_WRAPPED_ATTR, False):
@@ -135,6 +126,35 @@ def install() -> None:
         loop.set_exception_handler(_make_filtered_handler(original))
         setattr(loop, _LOOP_WRAPPED_ATTR, True)
         _INSTALLED = True
+
+
+def install(app=None) -> None:
+    """Schedule the filter to install on the app's running event loop.
+
+    Why deferred: ``setup_cplugapi`` runs during route mounting, which
+    is a sync context BEFORE uvicorn boots its loop. ``asyncio.
+    get_event_loop()`` from there returns a freshly-created throwaway
+    loop in Python 3.12+ — wrapping its handler does nothing because
+    uvicorn binds a different loop at startup. We register a startup
+    event handler instead, so installation runs inside the actual
+    serving loop and ``asyncio.get_running_loop()`` is well-defined.
+
+    Windows-only — other platforms don't surface the proactor cleanup
+    race. ``app=None`` is accepted for the test path that wants to
+    drive ``_install_on_running_loop`` directly from a coroutine.
+    """
+    if sys.platform != "win32":
+        return
+
+    if app is None:
+        # Test path: caller (a coroutine) drives installation directly.
+        _install_on_running_loop()
+        return
+
+    async def _on_startup() -> None:
+        _install_on_running_loop()
+
+    app.add_event_handler("startup", _on_startup)
 
 
 def is_installed() -> bool:

@@ -98,8 +98,11 @@ def setup_cplugapi(
         # Demote benign Windows asyncio connection-reset noise to DEBUG.
         # The desktop client routinely closes connections to preempt
         # in-flight gens; without this filter every preempt logs a
-        # WinError-10054 traceback that drowns out real signal.
-        asyncio_filter.install()
+        # WinError-10054 traceback that drowns out real signal. Pass
+        # ``app`` so installation defers to the Starlette startup event
+        # — uvicorn's running loop isn't reachable from this sync
+        # context (we're called during route mounting).
+        asyncio_filter.install(app)
         _install_middlewares(app)
         _do_mount(app, auth_dependency)
         setattr(app.state, _MOUNT_FLAG, True)

@@ -106,20 +106,34 @@ def test_filtered_handler_falls_back_to_default_when_no_original():
 
 @pytest.mark.skipif(sys.platform != "win32", reason="filter is Windows-only")
 def test_install_is_idempotent_on_windows():
-    """Calling install twice on the same loop must not double-wrap.
-    Otherwise each install adds another layer and the chain grows
-    unboundedly across webui reloads."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        asyncio_filter.install()
-        first = loop.get_exception_handler()
-        asyncio_filter.install()
-        second = loop.get_exception_handler()
+    """Calling install twice on the same running loop must not
+    double-wrap. Otherwise each install adds another layer and the
+    chain grows unboundedly across webui reloads."""
+
+    async def _drive():
+        asyncio_filter._install_on_running_loop()
+        first = asyncio.get_running_loop().get_exception_handler()
+        asyncio_filter._install_on_running_loop()
+        second = asyncio.get_running_loop().get_exception_handler()
         assert first is second
-    finally:
-        loop.close()
-        asyncio.set_event_loop(None)
+        assert first is not None  # actually wrapped, not the default
+
+    asyncio.run(_drive())
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="filter is Windows-only")
+def test_install_via_app_defers_to_startup_event():
+    """``install(app)`` must NOT touch the loop synchronously — uvicorn's
+    real loop isn't reachable yet at route-mount time. Instead it
+    registers a startup hook that runs once the loop is live."""
+    from starlette.applications import Starlette
+
+    app = Starlette()
+    handlers_before = list(app.router.on_startup)
+    asyncio_filter.install(app)
+    handlers_after = list(app.router.on_startup)
+    # Exactly one new startup handler was registered.
+    assert len(handlers_after) == len(handlers_before) + 1
 
 
 def test_install_silent_on_non_windows():
