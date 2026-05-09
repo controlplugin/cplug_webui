@@ -469,3 +469,84 @@ def test_resolves_falls_back_to_wrapper_for_unknown_subclass():
 
     wrapper = types.SimpleNamespace(some_other_field="x")
     assert _resolve_controlnet_inner(wrapper) is wrapper
+
+
+# --- regression: from-import consumer rebinding ---------------------------
+#
+# Production bug discovered after the inner-weights fix shipped:
+# ``modules_forge/supported_controlnet.py`` does ``from backend.patcher.
+# controlnet import apply_controlnet_advanced`` at import time, capturing
+# the ORIGINAL function. Our monkey-patch on the source module didn't
+# update that local copy, so the consumer kept calling the unwrapped
+# function and the cache silently never fired. The install path now
+# walks ``_KNOWN_CONSUMER_MODULES`` and rebinds each consumer's local
+# symbol if it still points at the original.
+
+
+def test_install_rebinds_known_consumer_module(
+    fake_controlnet_module, fresh_cache, monkeypatch,
+):
+    """The install path must rebind ``modules_forge.supported_controlnet.
+    apply_controlnet_advanced`` so the consumer's call site actually
+    routes through our wrapper. Otherwise the cache is dead code in
+    production."""
+    module, _, _, _ = fake_controlnet_module
+    original = module.apply_controlnet_advanced
+
+    # Simulate a consumer that did ``from backend.patcher.controlnet
+    # import apply_controlnet_advanced`` — captures the original.
+    consumer = types.ModuleType("modules_forge.supported_controlnet")
+    consumer.apply_controlnet_advanced = original
+    monkeypatch.setitem(sys.modules, "modules_forge.supported_controlnet", consumer)
+
+    fresh_cache.apply(module)
+
+    # After install, the consumer's binding must point at the wrapper,
+    # not the original — otherwise calls through the consumer still
+    # bypass the cache.
+    assert consumer.apply_controlnet_advanced is module.apply_controlnet_advanced
+    assert consumer.apply_controlnet_advanced is not original
+
+
+def test_install_does_not_clobber_consumer_with_custom_binding(
+    fake_controlnet_module, fresh_cache, monkeypatch, caplog,
+):
+    """If a consumer module has rebound the symbol to its OWN function
+    (some competing extension), don't clobber. Log a warning so the
+    missed coverage is visible."""
+    module, _, _, _ = fake_controlnet_module
+
+    competing = lambda *args, **kwargs: "competing"  # noqa: E731
+    consumer = types.ModuleType("modules_forge.supported_controlnet")
+    consumer.apply_controlnet_advanced = competing
+    monkeypatch.setitem(sys.modules, "modules_forge.supported_controlnet", consumer)
+
+    logger = logging.getLogger("modules.cplugapi.controlnet_cache")
+    original_propagate = logger.propagate
+    logger.propagate = True
+    try:
+        with caplog.at_level(logging.WARNING, logger=logger.name):
+            fresh_cache.apply(module)
+    finally:
+        logger.propagate = original_propagate
+
+    assert consumer.apply_controlnet_advanced is competing  # untouched
+    assert any(
+        "is not the upstream function" in r.getMessage()
+        for r in caplog.records if r.name == logger.name
+    )
+
+
+def test_install_silent_when_consumer_unloaded(
+    fake_controlnet_module, fresh_cache, monkeypatch,
+):
+    """If the consumer module isn't in ``sys.modules`` yet, install is
+    silent — the consumer's later import will pick up our wrapped
+    function from the source module."""
+    module, _, _, _ = fake_controlnet_module
+
+    # Ensure the consumer key is NOT in sys.modules.
+    monkeypatch.delitem(sys.modules, "modules_forge.supported_controlnet", raising=False)
+
+    # Should not raise.
+    assert fresh_cache.apply(module) is True

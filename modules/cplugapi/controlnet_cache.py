@@ -463,6 +463,22 @@ def _resolve_target_module():
     return controlnet
 
 
+# Modules that imported ``apply_controlnet_advanced`` BY NAME via
+# ``from backend.patcher.controlnet import apply_controlnet_advanced``.
+# Python's ``from X import Y`` copies the reference at import time, so
+# rebinding ``X.Y`` later does NOT update ``the_module.Y``. To make the
+# wrapper actually intercept production calls we have to rebind each
+# consumer's local copy too. Add new consumers here when grep finds
+# them.
+#
+# Identified via:
+#     grep -rn "from backend.patcher.controlnet import" .
+#     grep -rn "from backend.patcher import controlnet" .  # qualified — safe
+_KNOWN_CONSUMER_MODULES: tuple[str, ...] = (
+    "modules_forge.supported_controlnet",
+)
+
+
 def apply(target_module=None) -> bool:
     """Wrap ``apply_controlnet_advanced`` on the target module.
 
@@ -503,14 +519,75 @@ def apply(target_module=None) -> bool:
         )
         return False
 
-    target_module.apply_controlnet_advanced = _build_wrapped_apply(original)
+    wrapped = _build_wrapped_apply(original)
+    target_module.apply_controlnet_advanced = wrapped
     setattr(target_module, _INSTALL_FLAG, True)
+
+    # Rebind known consumers that imported the symbol BY NAME via
+    # ``from backend.patcher.controlnet import apply_controlnet_advanced``.
+    # Without this the production call at
+    # ``modules_forge/supported_controlnet.py:207`` continues to invoke
+    # the ORIGINAL (the local copy captured at import time), the cache
+    # never fires, and the perf bug remains hidden behind a "patched"
+    # log line. See _KNOWN_CONSUMER_MODULES.
+    rebound = _rebind_known_consumers(original, wrapped)
+
     _log.info(
-        "cplugapi: patched %s.apply_controlnet_advanced (controlnet patcher cache, %s)",
+        "cplugapi: patched %s.apply_controlnet_advanced (controlnet patcher cache, %s; rebound %d consumer(s))",
         target_module.__name__,
         "enabled" if _emission_enabled else "disabled — passthrough",
+        rebound,
     )
     return True
+
+
+def _rebind_known_consumers(original, wrapped) -> int:
+    """For each ``from backend.patcher.controlnet import apply_controlnet_advanced``
+    consumer, rebind its local symbol to ``wrapped`` if (and only if)
+    it currently points at ``original``.
+
+    The identity guard matters: if a consumer rebound the symbol itself
+    (some test fixture, a competing patch, etc.) we don't clobber.
+    Returns the count of consumers actually rebound, for logging.
+    """
+    import sys
+
+    rebound = 0
+    for module_name in _KNOWN_CONSUMER_MODULES:
+        module = sys.modules.get(module_name)
+        if module is None:
+            # Consumer not loaded yet. The patch will still take effect
+            # if the consumer hasn't imported anything — its later
+            # ``from`` will see our wrapped function on the source. The
+            # gotcha is consumers that loaded BEFORE us; for them we
+            # need to be in their namespace already, which means this
+            # rebind has to run after the consumer imports.
+            continue
+        current = getattr(module, "apply_controlnet_advanced", None)
+        if current is original:
+            module.apply_controlnet_advanced = wrapped
+            rebound += 1
+        elif current is wrapped:
+            # Already rebound by a prior call (idempotent).
+            pass
+        elif current is None:
+            # Consumer module exists but didn't import the symbol.
+            # Possible if the consumer used the qualified form
+            # (``from backend.patcher import controlnet`` then
+            # ``controlnet.apply_controlnet_advanced(...)``) — in which
+            # case our source-module patch is sufficient. No work to do.
+            pass
+        else:
+            # Consumer has its own version (rare — competing extension?).
+            # Don't clobber. Surface the divergence so a future
+            # debugger sees the missed coverage.
+            _log.warning(
+                "cplugapi: %s.apply_controlnet_advanced is not the upstream "
+                "function (got %r); cache wrapper not rebound there",
+                module_name,
+                current,
+            )
+    return rebound
 
 
 def is_applied(target_module=None) -> bool:

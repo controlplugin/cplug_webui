@@ -275,3 +275,71 @@ Regression tests added:
 - Three resolver tests for the per-subclass field paths.
 
 `pytest tests/` → 337 passed, 4 skipped.
+
+## Second follow-up — monkey-patch didn't reach the consumer
+
+Even after the inner-weights fix tested clean, the production log
+*still* showed `Requested to load KModel / ControlNet` and
+`Moving model(s) has taken X seconds` on every gen. Three parallel
+investigation agents converged on the diagnosis: our monkey-patch
+on `backend.patcher.controlnet.apply_controlnet_advanced` never
+intercepted the actual call site.
+
+Reason: `modules_forge/supported_controlnet.py:9-12` does
+
+```python
+from backend.patcher.controlnet import (
+    ...
+    apply_controlnet_advanced,
+    ...
+)
+```
+
+Python's `from X import Y` copies the reference into the consumer's
+namespace **at import time**. The consumer's `apply_controlnet_advanced`
+is a local copy of the original function, captured before our
+patch ran. Rebinding `backend.patcher.controlnet.apply_controlnet_advanced`
+later doesn't update that local copy. The call at
+`supported_controlnet.py:207` continued invoking the original, the
+cache was dead code, and the install log line was misleadingly
+optimistic.
+
+Same Python gotcha as `unittest.mock.patch` documents: you have to
+patch the consumer's local binding, not just the source module.
+
+Fix: install path now also walks a `_KNOWN_CONSUMER_MODULES` tuple
+(currently just `modules_forge.supported_controlnet`) and rebinds
+each consumer's local symbol IF it currently points at the original.
+Identity guard prevents clobbering competing extensions that have
+their own version. Unloaded consumers are skipped silently — their
+later import will pick up our wrapped function from the source.
+
+Boot log now reports the rebind count:
+
+```
+cplugapi: patched backend.patcher.controlnet.apply_controlnet_advanced
+(controlnet patcher cache, enabled; rebound 1 consumer(s))
+```
+
+Three regression tests added: rebind happens for known consumers,
+custom bindings are NOT clobbered (warning logged), missing consumer
+modules don't crash install.
+
+### Architectural lesson
+
+Two separate `from-import` blast radii missed in 24 hours (this fix
++ the late-abort hook earlier). Worth pinning as a project rule for
+any future monkey-patch under `modules/cplugapi/`:
+
+> Before declaring a monkey-patch "installed", grep the codebase for
+> `from <target.module> import <symbol>` and rebind every consumer
+> that captures the symbol locally. The source module patch alone
+> only catches `module.symbol(...)` call patterns, not `symbol(...)`
+> after a `from-import`.
+
+The `_KNOWN_CONSUMER_MODULES` constant explicitly lists the
+consumers we audited — adding a new monkey-patch should re-grep and
+extend the list. Don't iterate `sys.modules` automatically; the
+explicit list is auditable and survives upstream rebases.
+
+`pytest tests/` → 340 passed, 4 skipped.
