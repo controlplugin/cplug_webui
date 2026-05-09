@@ -48,7 +48,30 @@ the prefix the middleware is a no-op so the byte-identity invariant on
 Native clients (no `Origin` header) and `file://` pages (`Origin: null`)
 are accepted; loopback browsers are accepted by regex match.
 
-## Access log
+## Diagnostic logging — default off in the fork
+
+The fork ships with three structured log streams. All three are
+**off by default in `webui-user.bat`** because the desktop client
+polls progress at ~4 Hz during a gen, which floods the console
+when the loggers are live during normal operation. They are
+operator-facing diagnostics: flip on while triaging, flip off
+once you understand what the client is doing.
+
+| Env var | Stream | Logger | Capability |
+|---|---|---|---|
+| `CPLUG_ACCESS_LOG=1` | `/cplugapi/v1/*` request log | `cplugapi.access` | `request-log` |
+| `CPLUG_SDAPI_OBSERVER=1` | `/sdapi/v1/*` request log | `cplugapi.sdapi` | `sdapi-request-log` |
+| `CPLUG_GEN_TIMING=1` | per-gen pipeline timing | `cplugapi.gen_timing` | `gen-timing` |
+
+All three follow the same pattern: each value is read **once at install
+time**, so toggling requires a webui restart. Setting `0` / `false` /
+`no` / `off` disables emission while leaving the install path live (so
+existing tests and observers can still introspect the underlying
+infrastructure). Capability advertisement also tracks the toggle —
+disabled streams are absent from `/health.capabilities[]`, which lets a
+client detect "log routing is off, don't expect lines".
+
+### Access log (`/cplugapi/v1/*`)
 
 One structured line per `/cplugapi/v1/*` request is emitted to the
 `cplugapi.access` Python logger at INFO level. Format:
@@ -73,9 +96,8 @@ The middleware sits outermost in the chain by design — its `dur_ms`
 spans every other cplugapi middleware plus the handler. Outside the
 prefix it is a straight pass-through (zero log lines, zero overhead).
 
-Set `CPLUG_ACCESS_LOG=0` (or `false`/`no`/`off`) to disable emission;
-the middleware still installs but skips the format step. Capability
-string: `request-log`.
+Toggle: `CPLUG_ACCESS_LOG=1` to enable (fork default in
+`webui-user.bat` is `0`). Capability string: `request-log`.
 
 ## Auto-preempt on `/sdapi/v1/{txt2img,img2img}`
 
@@ -116,7 +138,7 @@ Read-only on the upstream surface: when no preempt fires, the
 middleware is a straight pass-through. Preserves byte-identity on
 `/sdapi/v1/*`.
 
-## sdapi request log
+### sdapi request log (`/sdapi/v1/*`)
 
 Pure-ASGI observer wrapped around `/sdapi/v1/*` (the surface the
 desktop client actually calls for `txt2img` / `img2img`). Emits one
@@ -145,9 +167,10 @@ Diagnostic intent: this is the log to watch when the desktop client
 fires gens you can't account for. Tails to console alongside
 `cplugapi.access` (cplugapi-specific lines) and
 `cplugapi.gen_timing` (one summary line per `process_images_inner`).
+Toggle: `CPLUG_SDAPI_OBSERVER=1` to enable (fork default `0`).
 Capability: `sdapi-request-log`.
 
-## Generation timing log
+### Generation timing log
 
 One structured line per call to `modules.processing.process_images_inner`
 (i.e. one per `/sdapi/v1/txt2img` / `img2img` request) is emitted to
@@ -176,6 +199,9 @@ encode, init prep, kernel JIT, etc.). That pre-sampling number is
 the one that grows when the model is being evicted/reloaded between
 gens.
 
+Toggle: `CPLUG_GEN_TIMING=1` to enable (fork default `0`). The
+hooks themselves stay installed when emission is off, so a future
+on-toggle (after restart) doesn't require re-importing the module.
 Capability string: `gen-timing`.
 
 ## Cross-cutting headers
@@ -450,19 +476,60 @@ sdapi/preempt-<mode>
 
 ## Environment variables
 
-| Var | Default | Used by |
+All read **once at process start** unless noted otherwise — toggling
+requires a webui restart. The fork's `webui-user.bat` ships sensible
+defaults; this table is the canonical reference for what each knob
+does and what value the *module* falls back to when the env var is
+unset (the launcher may set a different default, called out where
+relevant).
+
+### Security middleware (`modules/cplugapi/security.py`)
+
+| Var | Module default | Effect |
 |---|---|---|
-| `CPLUG_ALLOWED_ORIGINS` | empty (loopback regex only) | security middleware |
-| `CPLUG_ALLOWED_HOSTS` | `127.0.0.1,localhost,[::1]` | security middleware |
-| `CPLUG_MAX_BODY_BYTES` | `33554432` (32 MiB) | security middleware |
-| `CPLUG_IDEMPOTENCY_MAX` | `1024` | idempotency cache |
-| `CPLUG_IDEMPOTENCY_TTL_S` | `86400` (24 h) | idempotency cache |
-| `CPLUG_MODELS_CACHE_MAX` | `4096` | model arch cache |
-| `CPLUG_ACCESS_LOG` | enabled | per-request access log (set `0` to disable) |
-| `CPLUG_PREEMPT_MODE` | `always` | auto-preempt on `/sdapi/v1/{txt2img,img2img}` — `always` / `header` / `off` |
-| `CPLUG_FORK_COMMIT` | `unknown` | `__version__` (CI) |
-| `CPLUG_UPSTREAM_COMMIT` | `unknown` | `__version__` (CI) |
-| `CPLUG_FORK_BUILD_DATE` | process start (UTC ISO-8601) | `__version__` (CI) |
+| `CPLUG_ALLOWED_ORIGINS` | empty (loopback regex only) | CSV of `Origin` values to accept in addition to loopback. Add for browser-based clients on non-loopback origins. |
+| `CPLUG_ALLOWED_HOSTS` | `127.0.0.1,localhost,[::1]` | CSV `Host` allow-list — DNS-rebinding defense. Extend to bind to a LAN hostname. |
+| `CPLUG_MAX_BODY_BYTES` | `33554432` (32 MiB) | Hard cap on declared `Content-Length`. Raise for very large img2img inputs. |
+
+### Idempotency cache (`modules/cplugapi/idempotency.py`)
+
+| Var | Module default | Effect |
+|---|---|---|
+| `CPLUG_IDEMPOTENCY_MAX` | `1024` | Max cached responses (LRU). Beyond this, oldest entries evict. |
+| `CPLUG_IDEMPOTENCY_TTL_S` | `86400` (24 h) | Per-entry TTL in seconds. Replays after expiry re-execute the handler. |
+
+### Model arch cache (`modules/cplugapi/models_disk.py`)
+
+| Var | Module default | Effect |
+|---|---|---|
+| `CPLUG_MODELS_CACHE_MAX` | `4096` | Max checkpoints kept in the safetensors-header / pickle-peek cache. |
+
+### Diagnostic logging — fork default `0` in `webui-user.bat`
+
+| Var | Module default | Launcher default | Effect |
+|---|---|---|---|
+| `CPLUG_ACCESS_LOG` | enabled | `0` | One line per `/cplugapi/v1/*` request to `cplugapi.access`. |
+| `CPLUG_SDAPI_OBSERVER` | enabled | `0` | One line per `/sdapi/v1/*` request to `cplugapi.sdapi`. |
+| `CPLUG_GEN_TIMING` | enabled | `0` | One line per gen pipeline call to `cplugapi.gen_timing` (`total_ms`, `vae_decode_ms`, `peak_vram_mb`). |
+
+Module default is "enabled" so a developer running tests or boot
+without the launcher sees diagnostic output. The fork's launcher
+overrides to `0` because the desktop client polls progress at ~4 Hz
+during a gen, which floods the console during normal operation.
+
+### Auto-preempt (`modules/cplugapi/auto_preempt.py`)
+
+| Var | Module default | Values | Effect |
+|---|---|---|---|
+| `CPLUG_PREEMPT_MODE` | `always` | `always` / `header` / `off` | Cancel-on-submit policy for `/sdapi/v1/{txt2img,img2img}`. Invalid values fall back to `always` with a warning. See [Auto-preempt](#auto-preempt-on-sdapiv1txt2imgimg2img) for the per-mode semantics. |
+
+### Build identity (`modules/cplugapi/__version__.py`, populated by CI)
+
+| Var | Module default | Effect |
+|---|---|---|
+| `CPLUG_FORK_COMMIT` | `unknown` | Reported in `/identify.fork_commit` and `/version`. |
+| `CPLUG_UPSTREAM_COMMIT` | `unknown` | Reported in `/identify.upstream_commit` and `/version`. |
+| `CPLUG_FORK_BUILD_DATE` | process start (UTC ISO-8601) | Reported in `/version.fork_build_date`. |
 
 ## Hard invariants (CLAUDE.md)
 

@@ -7,6 +7,34 @@ grouped by **Added / Changed / Fixed / Removed**.
 
 ## Unreleased
 
+### Changed — diagnostic logs default off in `webui-user.bat`
+
+The three diagnostic streams (`/cplugapi/v1/*` access log,
+`/sdapi/v1/*` request observer, per-gen pipeline timing) are now
+toggled off by default in the fork's launcher. Each stream is
+controlled by its own env var, all read once at install time:
+
+| Var | Stream |
+|---|---|
+| `CPLUG_ACCESS_LOG` | `cplugapi.access` (per-cplugapi-request line) |
+| `CPLUG_SDAPI_OBSERVER` | `cplugapi.sdapi` (per-`/sdapi/v1/*` line) |
+| `CPLUG_GEN_TIMING` | `cplugapi.gen_timing` (per-gen `total_ms`/`vae_decode_ms`/`peak_vram_mb`) |
+
+`webui-user.bat` sets all three to `0` because the desktop client
+polls progress at ~4 Hz during a gen, which makes any of these
+streams loud enough to drown out warnings/errors during normal
+operation. Operators triaging client behavior flip the relevant
+toggle to `1` and restart.
+
+Module-level default remains "enabled" so devs running tests or
+booting without the launcher get the diagnostic output without
+needing extra setup. Capability registration tracks the toggle —
+disabled streams are absent from `/health.capabilities[]`, which
+lets a client detect "log routing is off" without round-tripping
+to a config endpoint.
+(`modules/cplugapi/access_log.py`, `sdapi_observer.py`,
+`gen_timing.py`, `webui-user.bat`)
+
 ### Added — auto-preempt for `/sdapi/v1/{txt2img,img2img}`
 
 Two-stage mechanism. **Pre-handler middleware**: pure-ASGI, fires
