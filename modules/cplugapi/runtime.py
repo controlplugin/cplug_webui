@@ -56,6 +56,18 @@ def apply_runtime_tweaks() -> None:
     memmgmt_patches.apply()
     memmgmt_patches.register_capabilities()
 
+    # Cache the patched UNet clone produced by
+    # ``backend.patcher.controlnet.apply_controlnet_advanced`` so the
+    # ~1 s detach/reattach walk in ``load_models_gpu`` doesn't fire on
+    # every gen when ControlNet is enabled. See
+    # ``modules/cplugapi/controlnet_cache.py`` for the design and
+    # ``devlog/2026-05-09-controlnet-patcher-cache.md`` for the
+    # rationale + alternatives we ruled out.
+    from . import controlnet_cache
+
+    controlnet_cache.apply()
+    controlnet_cache.register_capabilities()
+
 
 def _enable_cudnn_benchmark() -> None:
     """Default cudnn.benchmark ON (audit 01 §3.1).

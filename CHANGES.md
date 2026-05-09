@@ -7,6 +7,45 @@ grouped by **Added / Changed / Fixed / Removed**.
 
 ## Unreleased
 
+### Added — ControlNet patcher cache
+
+`backend/patcher/controlnet.py:apply_controlnet_advanced` produces a
+fresh `UnetPatcher` clone every gen (`m = unet.clone()` →
+`m.add_patched_controlnet(cnet)`). Forge's `LoadedModel.__eq__`
+compares patcher *identity*, so the lookup at
+`memory_management.py:629` misses unconditionally and the
+clone-cleanup path at `:642-650` runs every gen — detach the old
+patcher's hooks, reattach the new ones. The underlying weights
+never leave VRAM, but the walk costs ~1 s of "Moving model(s) has
+taken X seconds" per gen on the test rig (Illustrious-XL + Xinsir
+Union ProMax + 24 GB card under `--highvram`). Also generates the
+spammy `Reusing ControlNet Model… / Requested to load … / loaded
+completely` triplet on every gen.
+
+`modules/cplugapi/controlnet_cache.py` monkey-patches the upstream
+function (same pattern as `memmgmt_patches.py`) to cache the cloned
+UNet patcher keyed on `(id(unet_baseline), id(controlnet_baseline))`.
+On cache hit, the per-gen state (cond_hint, strength, percentages,
+the five `advanced_*_weighting` attrs, control_type) is mutated
+directly on the already-attached cnet — patcher identity stays
+stable across gens, the equality lookup hits, the clone-cleanup
+walk and its log spam don't fire.
+
+ID reuse after GC is handled via weakref guards on the baselines.
+Cache is bounded at 16 entries (FIFO). Disable via
+`CPLUG_CONTROLNET_CACHE=0` for passthrough. Capability:
+`controlnet/patcher-cache`.
+
+We initially considered broadening `LoadedModel.__eq__` to compare
+underlying-model identity, which would have fixed ToMe + ControlNet
++ any future patcher class in one shot. Audit found a correctness
+break — the new patcher's per-gen state would be silently dropped
+in favor of the old patcher's stale state. See
+`devlog/2026-05-09-controlnet-patcher-cache.md` for the full
+trace and rollback story.
+(`modules/cplugapi/controlnet_cache.py`,
+`modules/cplugapi/runtime.py`)
+
 ### Changed — diagnostic logs default off in `webui-user.bat`
 
 The three diagnostic streams (`/cplugapi/v1/*` access log,

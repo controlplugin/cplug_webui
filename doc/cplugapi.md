@@ -472,6 +472,7 @@ gen-timing
 sdapi-request-log
 sdapi/preempt
 sdapi/preempt-<mode>
+controlnet/patcher-cache
 ```
 
 ## Environment variables
@@ -516,6 +517,12 @@ Module default is "enabled" so a developer running tests or boot
 without the launcher sees diagnostic output. The fork's launcher
 overrides to `0` because the desktop client polls progress at ~4 Hz
 during a gen, which floods the console during normal operation.
+
+### ControlNet patcher cache (`modules/cplugapi/controlnet_cache.py`)
+
+| Var | Module default | Effect |
+|---|---|---|
+| `CPLUG_CONTROLNET_CACHE` | enabled | Cache the patched UNet clone produced by `apply_controlnet_advanced` so repeated gens with the same `(unet, controlnet)` baseline pair skip the ~1 s detach/reattach walk in `load_models_gpu`. Set `0` to restore upstream behaviour (passthrough). See `devlog/2026-05-09-controlnet-patcher-cache.md` for the design rationale and the `LoadedModel.__eq__` alternative we ruled out. |
 
 ### Auto-preempt (`modules/cplugapi/auto_preempt.py`)
 
