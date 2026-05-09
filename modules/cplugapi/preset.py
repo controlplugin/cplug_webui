@@ -28,8 +28,34 @@ import logging
 from typing import Any, Callable
 
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
 
 _log = logging.getLogger(__name__)
+
+
+class PresetApplyResponse(BaseModel):
+    """Response shape for ``POST /forge/preset/{name}``.
+
+    The ``applied`` map is intentionally untyped (``dict[str, Any]``)
+    because each preset reports a heterogeneous payload — flag previous-
+    values (str/int/float/None depending on the toggle) plus the
+    ``cuda_warmup`` success bool. Clients that want typed access should
+    branch on ``preset`` and look up the keys they care about.
+
+    Bound to the route via ``response_model=`` so ``/openapi.json``
+    surfaces the real shape for codegen — keeps client typings honest
+    and converts schema drift into a contract-test failure (see
+    ``tests/cplugapi/test_preset.py``).
+    """
+
+    preset: str = Field(
+        ...,
+        description="Echoes the preset name from the URL — handy for clients that pipeline multiple preset toggles and want to correlate responses.",
+    )
+    applied: dict[str, Any] = Field(
+        ...,
+        description="Map of toggle-name → previous-value (or, for synthetic markers like ``cuda_warmup``, the operation's success bool). Keys depend on the preset; see the per-preset docs in ``modules/cplugapi/preset.py``.",
+    )
 
 
 def _set_opt(name: str, value: Any) -> Any | None:
@@ -114,8 +140,8 @@ _PRESETS: dict[str, Callable[[], dict[str, Any]]] = {
 
 
 def attach(router: APIRouter) -> None:
-    @router.post("/forge/preset/{name}")
-    def apply(name: str) -> dict:
+    @router.post("/forge/preset/{name}", response_model=PresetApplyResponse)
+    def apply(name: str) -> PresetApplyResponse:
         """Apply a fork-only preset bundle.
 
         Supported presets: ``sketch`` (live-sketching defaults),
@@ -127,5 +153,4 @@ def attach(router: APIRouter) -> None:
                 status_code=404,
                 detail=f"unknown preset {name!r}; supported: {sorted(_PRESETS)}",
             )
-        applied = fn()
-        return {"preset": name, "applied": applied}
+        return PresetApplyResponse(preset=name, applied=fn())
