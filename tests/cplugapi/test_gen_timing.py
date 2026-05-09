@@ -221,3 +221,39 @@ def test_capability_registered(progress_stub, clean_capabilities):
     client = TestClient(app)
     caps = client.get(f"{PREFIX}/health").json()["capabilities"]
     assert "gen-timing" in caps
+
+
+def test_kill_switch_disables_emission(monkeypatch, fake_processing, caplog_gen):
+    """``CPLUG_GEN_TIMING=0`` must keep the timing log silent.
+
+    Read-once-at-install means the env var has to be set BEFORE
+    ``install_hooks`` snapshots ``_emission_enabled``. We set the env
+    var, force a fresh re-install, then run a gen and confirm no log
+    lines were emitted.
+    """
+    monkeypatch.setenv("CPLUG_GEN_TIMING", "0")
+    from modules.cplugapi import gen_timing as _gt
+    real_proc = sys.modules["modules.processing"]
+    if hasattr(real_proc, _gt._INSTALL_FLAG):
+        delattr(real_proc, _gt._INSTALL_FLAG)
+    _gt.install_hooks()
+
+    real_proc.process_images_inner("p")
+    assert _gen_records(caplog_gen) == []
+
+
+def test_kill_switch_omits_capability(monkeypatch, progress_stub, clean_capabilities):
+    """When emission is disabled the capability must also be absent so a
+    client can tell ``not in caps`` apart from ``in caps but no lines``."""
+    monkeypatch.setenv("CPLUG_GEN_TIMING", "0")
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from modules.cplugapi import PREFIX, setup_cplugapi
+
+    app = FastAPI()
+    setup_cplugapi(app)
+    client = TestClient(app)
+    caps = client.get(f"{PREFIX}/health").json()["capabilities"]
+    assert "gen-timing" not in caps

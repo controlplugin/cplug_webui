@@ -36,6 +36,7 @@ the byte-identity invariant on ``/sdapi/v1/*`` (CLAUDE.md §1).
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import Optional
@@ -56,6 +57,21 @@ except ImportError:
 _log = logging.getLogger("cplugapi.sdapi")
 if _setup_logger is not None:
     _setup_logger(_log)
+
+# Env-var kill switch. Mirrors ``access_log.CPLUG_ACCESS_LOG``: read once
+# at install, no hot-path env lookup. Disabling matters more here than
+# for access_log because the desktop client polls /sdapi/v1/progress at
+# ~4 Hz during a gen, which floods the console if the observer is
+# active during normal operation. Default is ON to keep the diagnostic
+# available out-of-the-box; the fork's webui-user.bat flips it off.
+_ENV_DISABLE = "CPLUG_SDAPI_OBSERVER"
+
+
+def _is_enabled() -> bool:
+    raw = os.environ.get(_ENV_DISABLE)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
 # Default prefixes this observer logs. ``/cplugapi/v1/`` is omitted —
@@ -91,11 +107,21 @@ class SdapiRequestObserver:
     streaming responses — see module docstring.
     """
 
-    def __init__(self, app, prefixes: tuple[str, ...] = DEFAULT_PREFIXES) -> None:
+    def __init__(
+        self,
+        app,
+        prefixes: tuple[str, ...] = DEFAULT_PREFIXES,
+        enabled: bool = True,
+    ) -> None:
         self.app = app
         self.prefixes = prefixes
+        self.enabled = enabled
 
     async def __call__(self, scope, receive, send):
+        if not self.enabled:
+            await self.app(scope, receive, send)
+            return
+
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
@@ -153,6 +179,10 @@ _install_lock = threading.Lock()
 def install(app: FastAPI, prefixes: tuple[str, ...] = DEFAULT_PREFIXES) -> None:
     """Attach the observer to ``app``. Idempotent + thread-safe.
 
+    Always installs the middleware so its enabled-state can flip across
+    test runs without re-mounting; runtime gating is via the ``enabled``
+    flag captured at install time from :func:`_is_enabled`.
+
     Inserts at position 0 of ``user_middleware`` so it runs OUTERMOST
     in the chain — its ``dur_ms`` covers every other cplugapi
     middleware plus the handler. Caller is responsible for invoking
@@ -165,11 +195,15 @@ def install(app: FastAPI, prefixes: tuple[str, ...] = DEFAULT_PREFIXES) -> None:
         if getattr(app.state, _INSTALL_FLAG, False):
             return
         app.user_middleware.insert(
-            0, Middleware(SdapiRequestObserver, prefixes=prefixes)
+            0,
+            Middleware(
+                SdapiRequestObserver, prefixes=prefixes, enabled=_is_enabled()
+            ),
         )
         setattr(app.state, _INSTALL_FLAG, True)
 
 
 def register_capabilities() -> None:
-    """Advertise the sdapi-side request observer."""
-    capabilities.register("sdapi-request-log")
+    """Advertise the sdapi-side request observer (only when enabled)."""
+    if _is_enabled():
+        capabilities.register("sdapi-request-log")

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import os
 import threading
 import time
 from typing import Any, Optional
@@ -51,6 +52,24 @@ try:
     _setup_logger(_log)
 except ImportError:
     pass  # OpenAPI export / tests stub backend out
+
+# Env-var kill switch — read once at install time. Disabling skips
+# emission only; the wrap is still installed so the contextvar
+# infrastructure stays consistent and other observers (e.g. tests)
+# can still introspect timings if they patch ``_emit`` directly.
+_ENV_DISABLE = "CPLUG_GEN_TIMING"
+
+
+def _is_enabled() -> bool:
+    raw = os.environ.get(_ENV_DISABLE)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+# Captured at install time so the runtime hot path doesn't pay an
+# env-var lookup per gen.
+_emission_enabled: bool = True
 
 # Per-gen timing context. ContextVar is the right primitive because
 # Forge dispatches gens onto worker threads; a thread-local would also
@@ -110,7 +129,15 @@ def _start_gen_record() -> dict:
 
 
 def _emit(record: dict, error: Optional[str] = None) -> None:
-    """Format + log one structured line for the completed gen."""
+    """Format + log one structured line for the completed gen.
+
+    No-op when emission is disabled via ``CPLUG_GEN_TIMING=0``. The
+    rest of the gen-timing infrastructure (contextvar, stage tracking,
+    peak-VRAM reset) stays live so a future toggle-on doesn't require
+    restart — though the env var itself is read once at install.
+    """
+    if not _emission_enabled:
+        return
     total_ms = (time.perf_counter() - record["start"]) * 1000.0
     stages: dict[str, float] = record["stages"]
     peak_vram = _peak_vram_mb()
@@ -151,7 +178,13 @@ def _record_stage(name: str, duration_ms: float) -> None:
 
 
 def install_hooks() -> None:
-    """Wrap the upstream gen pipeline functions. Idempotent."""
+    """Wrap the upstream gen pipeline functions. Idempotent.
+
+    Snapshots the env-var-driven enable flag at install time so the
+    hot path doesn't pay an env lookup per gen.
+    """
+    global _emission_enabled
+    _emission_enabled = _is_enabled()
     with _install_lock:
         try:
             from modules import processing as _proc
@@ -196,5 +229,6 @@ def install_hooks() -> None:
 
 
 def register_capabilities() -> None:
-    """Advertise per-gen pipeline timing."""
-    capabilities.register("gen-timing")
+    """Advertise per-gen pipeline timing (only when enabled)."""
+    if _is_enabled():
+        capabilities.register("gen-timing")

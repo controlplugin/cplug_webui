@@ -153,3 +153,30 @@ def test_capability_registered(progress_stub, clean_capabilities):
     client = TestClient(app)
     caps = client.get(f"{PREFIX}/health").json()["capabilities"]
     assert "sdapi-request-log" in caps
+
+
+def test_kill_switch_disables_emission(monkeypatch, caplog_sdapi, progress_stub, clean_capabilities):
+    """``CPLUG_SDAPI_OBSERVER=0`` must keep the observer silent.
+
+    Read-once-at-install means the env var has to be set BEFORE the
+    middleware is constructed. We set it, build a fresh app, fire a
+    request, and confirm no log lines were emitted.
+    """
+    monkeypatch.setenv("CPLUG_SDAPI_OBSERVER", "0")
+    client = TestClient(_build_app_with_sdapi_route())
+
+    r = client.get("/sdapi/v1/foo")
+    assert r.status_code == 200
+    assert _records(caplog_sdapi) == []
+
+
+def test_kill_switch_omits_capability(monkeypatch, progress_stub, clean_capabilities):
+    """When emission is disabled the capability must also be absent so a
+    client can tell ``not in caps`` apart from ``in caps but no lines``."""
+    monkeypatch.setenv("CPLUG_SDAPI_OBSERVER", "0")
+    from modules.cplugapi import PREFIX
+    app = FastAPI()
+    setup_cplugapi(app)
+    client = TestClient(app)
+    caps = client.get(f"{PREFIX}/health").json()["capabilities"]
+    assert "sdapi-request-log" not in caps
