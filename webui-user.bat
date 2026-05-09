@@ -4,7 +4,7 @@
 :: set GIT=
 :: set VENV_DIR=
 
-set COMMANDLINE_ARGS=--api --xformers --uv --cuda-malloc --highvram
+set COMMANDLINE_ARGS=--api --xformers --uv
 
 :: --api                                                — required: exposes /sdapi/v1/* + /cplugapi/v1/* for the ControlPlugin client.
 :: --xformers                                           — safe acceleration; broad GPU coverage. Mutually exclusive with --sage.
