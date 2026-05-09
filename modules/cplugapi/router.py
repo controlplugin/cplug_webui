@@ -26,6 +26,7 @@ from . import (
     request_id,
     runtime,
     sd_checkpoints,
+    sdapi_observer,
     security_middleware,
     session_cancel,
     version_endpoint,
@@ -54,6 +55,7 @@ def _register_capabilities() -> None:
     queue_endpoint.register_capabilities()
     access_log.register_capabilities()
     gen_timing.register_capabilities()
+    sdapi_observer.register_capabilities()
     # Model arch detection (/v1/models/*).
     active_model.register_capabilities()
     sd_checkpoints.register_capabilities()
@@ -115,6 +117,11 @@ def _install_middlewares(app: FastAPI) -> None:
     request_id.install(app)
     security_middleware.install(app)
     access_log.install(app)
+    # /sdapi/v1/* observer — pure ASGI, doesn't share BaseHTTPMiddleware's
+    # streaming-response footgun. Installed last so it runs FIRST in the
+    # chain (Starlette runs most-recently-added first), giving its
+    # dur_ms full coverage of every other layer plus the handler.
+    sdapi_observer.install(app)
     # Force a rebuild — Starlette caches the live stack on first request,
     # and ``build_middleware_stack()`` only returns the new stack rather
     # than installing it. Reassign so the next request picks up the new

@@ -43,6 +43,14 @@ from typing import Any, Optional
 from . import capabilities
 
 _log = logging.getLogger("cplugapi.gen_timing")
+try:
+    # Forge's logging helper installs a Rich console handler at the
+    # configured log level. Without it our INFO lines are swallowed by
+    # the default root config.
+    from backend.logging import setup_logger as _setup_logger
+    _setup_logger(_log)
+except ImportError:
+    pass  # OpenAPI export / tests stub backend out
 
 # Per-gen timing context. ContextVar is the right primitive because
 # Forge dispatches gens onto worker threads; a thread-local would also

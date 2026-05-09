@@ -77,6 +77,37 @@ Set `CPLUG_ACCESS_LOG=0` (or `false`/`no`/`off`) to disable emission;
 the middleware still installs but skips the format step. Capability
 string: `request-log`.
 
+## sdapi request log
+
+Pure-ASGI observer wrapped around `/sdapi/v1/*` (the surface the
+desktop client actually calls for `txt2img` / `img2img`). Emits one
+line per request to the `cplugapi.sdapi` logger:
+
+```text
+POST /sdapi/v1/img2img status=200 dur_ms=4567.8 in=23456
+```
+
+Fields: `method`, `path`, `status`, `dur_ms`, `in_bytes` (request
+Content-Length, or `-1` if not declared). Failures still log; the
+line includes `error=<ExceptionName>`.
+
+Why a separate observer instead of extending `cplugapi.access` over
+`/sdapi/v1/*`: the access middleware inherits from Starlette's
+`BaseHTTPMiddleware`, which interacts badly with `StreamingResponse`
+generators that raise mid-flight (encode/starlette#1438) — Gradio
+long-poll endpoints under the upstream surface use streaming, so
+wrapping them with `BaseHTTPMiddleware` produces spurious
+`RuntimeError: No response returned`. The observer is pure ASGI:
+wraps the inner app's `send` callable to capture status, no anyio
+task groups, no buffering. Read-only — request and response bytes
+are unchanged, byte-identity invariant preserved.
+
+Diagnostic intent: this is the log to watch when the desktop client
+fires gens you can't account for. Tails to console alongside
+`cplugapi.access` (cplugapi-specific lines) and
+`cplugapi.gen_timing` (one summary line per `process_images_inner`).
+Capability: `sdapi-request-log`.
+
 ## Generation timing log
 
 One structured line per call to `modules.processing.process_images_inner`
@@ -344,6 +375,7 @@ models/disk-scan
 models/architectures-available
 request-log
 gen-timing
+sdapi-request-log
 ```
 
 ## Environment variables

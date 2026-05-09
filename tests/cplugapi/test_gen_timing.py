@@ -55,8 +55,17 @@ def fake_processing(monkeypatch):
 
 @pytest.fixture
 def caplog_gen(caplog):
+    """Forge's ``setup_logger`` sets ``propagate=False`` so production
+    output goes through the Rich console handler. Caplog attaches to
+    root, so we flip propagate on for the test."""
+    logger = logging.getLogger("cplugapi.gen_timing")
+    original = logger.propagate
+    logger.propagate = True
     caplog.set_level(logging.INFO, logger="cplugapi.gen_timing")
-    return caplog
+    try:
+        yield caplog
+    finally:
+        logger.propagate = original
 
 
 def _gen_records(caplog):

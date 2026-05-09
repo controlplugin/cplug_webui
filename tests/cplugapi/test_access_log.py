@@ -23,9 +23,20 @@ from modules.cplugapi import PREFIX, access_log, setup_cplugapi
 
 @pytest.fixture
 def caplog_access(caplog):
-    """Capture only the cplugapi.access logger at INFO level."""
+    """Capture only the cplugapi.access logger at INFO level.
+
+    Forge's ``setup_logger`` sets ``propagate=False`` on cplugapi
+    loggers (so production output goes through the Rich console
+    handler, not the root). Pytest's caplog attaches to root, so we
+    flip propagate back on for the test."""
+    logger = logging.getLogger("cplugapi.access")
+    original = logger.propagate
+    logger.propagate = True
     caplog.set_level(logging.INFO, logger="cplugapi.access")
-    return caplog
+    try:
+        yield caplog
+    finally:
+        logger.propagate = original
 
 
 def _make_client():

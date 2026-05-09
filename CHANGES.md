@@ -7,6 +7,30 @@ grouped by **Added / Changed / Fixed / Removed**.
 
 ## Unreleased
 
+### Added — `/sdapi/v1/*` request observer + console-routed cplugapi loggers
+
+`cplugapi.sdapi` logger now emits one structured line per
+`/sdapi/v1/*` request: method, path, status, dur_ms, request
+Content-Length. Implemented as a pure-ASGI middleware (NOT
+`BaseHTTPMiddleware`) so it sidesteps the streaming-response wrapper
+bug and can sit on Gradio long-poll endpoints without breaking them.
+Read-only — preserves byte-identity on the upstream surface.
+Capability: `sdapi-request-log`.
+
+The diagnostic intent is "what is the desktop client triggering" —
+when the artist sees gens fire on canvas with no apparent action on
+their side, this log shows exactly which endpoint was called, when,
+and how long it took.
+
+The `cplugapi.access` and `cplugapi.gen_timing` loggers are now
+routed through Forge's `backend.logging.setup_logger`, so their
+lines appear on console alongside Forge's own boot output (same
+`name :: INFO` rendering). Previously these messages were dropped
+because Forge's default Python logging config silences INFO-level
+messages on stderr.
+(`modules/cplugapi/sdapi_observer.py`,
+`modules/cplugapi/access_log.py`, `modules/cplugapi/gen_timing.py`)
+
 ### Fixed — `RuntimeError: No response returned` on Gradio streaming paths
 
 All four cplugapi middlewares (access_log, request_id, security,

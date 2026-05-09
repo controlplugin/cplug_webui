@@ -51,8 +51,17 @@ from . import capabilities
 _PREFIX = "/cplugapi/v1"
 
 # Dedicated logger so users can route access output independently from
-# warnings/errors emitted by the rest of the cplugapi modules.
+# warnings/errors emitted by the rest of the cplugapi modules. Routed
+# through Forge's setup_logger so the lines appear on console with the
+# same ``name :: INFO`` formatting as the boot output — Python's
+# default logging config (which Forge inherits implicitly) drops
+# INFO-level messages on stderr otherwise.
 _log = logging.getLogger("cplugapi.access")
+try:
+    from backend.logging import setup_logger as _setup_logger
+    _setup_logger(_log)
+except ImportError:
+    pass  # OpenAPI export / tests stub backend out
 
 # Env-var kill switch. Read once at install time so toggling it requires
 # a restart — the middleware is meant to be cheap (sub-microsecond when
