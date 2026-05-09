@@ -15,6 +15,7 @@ from . import (
     access_log,
     active_model,
     architectures,
+    asyncio_filter,
     capabilities,
     gen_timing,
     health,
@@ -84,6 +85,11 @@ def setup_cplugapi(
 
         runtime.apply_runtime_tweaks()
         gen_timing.install_hooks()
+        # Demote benign Windows asyncio connection-reset noise to DEBUG.
+        # The desktop client routinely closes connections to preempt
+        # in-flight gens; without this filter every preempt logs a
+        # WinError-10054 traceback that drowns out real signal.
+        asyncio_filter.install()
         _install_middlewares(app)
         _do_mount(app, auth_dependency)
         setattr(app.state, _MOUNT_FLAG, True)

@@ -7,6 +7,24 @@ grouped by **Added / Changed / Fixed / Removed**.
 
 ## Unreleased
 
+### Fixed — Windows asyncio `ConnectionResetError` traceback spam
+
+asyncio's Windows ``ProactorEventLoop`` calls
+``ProactorBasePipeTransport._call_connection_lost`` when a TCP
+transport closes; the cleanup tries ``socket.shutdown(SHUT_RDWR)``
+which raises ``WinError 10054`` (ConnectionResetError) when the peer
+sent RST instead of FIN. Python's default asyncio handler logs this
+as ``Exception in callback…`` even though the cleanup itself is
+benign — the connection is already gone, no work is lost.
+
+The desktop ControlPlugin client closes connections this way
+routinely (preempting in-flight gens for fresh sketch strokes), so
+without filtering the log fills with these tracebacks. New
+`modules/cplugapi/asyncio_filter.py` wraps the running loop's
+exception handler to recognise this specific signature and demote
+it to DEBUG. Real ConnectionResetErrors elsewhere in the app pass
+through unchanged. Windows-only, idempotent.
+
 ### Added — `/sdapi/v1/*` request observer + console-routed cplugapi loggers
 
 `cplugapi.sdapi` logger now emits one structured line per
