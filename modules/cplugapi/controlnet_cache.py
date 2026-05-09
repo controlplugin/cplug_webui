@@ -432,6 +432,20 @@ def _build_wrapped_apply(original):
             control_type=control_type,
         )
 
+        # Tag the cnet linked into the result so our cleanup wrapper
+        # (see :func:`_build_wrapped_cleanup`) knows to skip the
+        # ``unload_model`` call at sampling_cleanup time. Without this
+        # tag, every gen ends with ``cnet.cleanup()`` popping the cnet's
+        # ``control_model_wrapped`` from ``current_loaded_models``, and
+        # the next gen's ``load_models_gpu`` lookup misses → a noisy
+        # "Requested to load ControlNet" log line + redundant LoadedModel
+        # construction. The tag scopes the skip to OUR cached cnets only —
+        # a non-cached cnet's cleanup proceeds normally and stays
+        # correct under checkpoint swaps.
+        cached_cnet = result.controlnet_linked_list
+        if cached_cnet is not None:
+            cached_cnet._cplug_cache_held = True
+
         with _cache_lock:
             _cache[key] = _CacheEntry(unet, controlnet_inner, result)
             _evict_one_if_needed()
@@ -448,6 +462,94 @@ def _build_wrapped_apply(original):
         "for the full design. Mutates per-gen state on cache hit."
     )
     return wrapped
+
+
+def _build_wrapped_cleanup(original_cleanup):
+    """Wrap ``ControlNet.cleanup`` to skip ``unload_model`` for cnets
+    we hold in cache.
+
+    Why this exists: the cache is necessary but not sufficient. Even
+    when ``apply_controlnet_advanced`` returns the same UnetPatcher
+    across gens (KModel detach/reattach skipped), Forge's
+    ``sampling_cleanup`` still calls ``cnet.cleanup()`` at the end of
+    every gen, which calls
+    ``memory_management.unload_model(self.control_model_wrapped)`` and
+    pops the cnet's wrapped patcher from ``current_loaded_models``.
+    Next gen's ``load_models_gpu`` lookup misses → "Requested to load
+    ControlNet" log fires → entry re-inserted (cheap, no weight
+    movement, but the log is noise + the LoadedModel construction is
+    wasted churn).
+
+    The skip is scoped to cnets tagged with ``_cplug_cache_held``
+    (set when we install the entry). Untagged cnets — those produced
+    by a non-cached call path or from a competing extension — clean
+    up normally so we don't break their lifecycle.
+
+    We still need ``ControlBase.cleanup`` semantics: clearing
+    ``cond_hint`` / ``timestep_range`` keeps the cnet ready for the
+    next gen's mutate-on-hit (set_cond_hint will repopulate them).
+    The simplest safe path is to invoke the original cleanup but
+    intercept the ``memory_management.unload_model`` call on tagged
+    cnets — done by temporarily swapping that symbol on the
+    ``backend.memory_management`` module while the original runs.
+    See :func:`_invoke_cleanup_with_unload_skipped`.
+    """
+
+    def wrapped_cleanup(self):
+        if not getattr(self, "_cplug_cache_held", False):
+            return original_cleanup(self)
+        return _invoke_cleanup_with_unload_skipped(original_cleanup, self)
+
+    wrapped_cleanup.__name__ = "cleanup"
+    wrapped_cleanup.__qualname__ = "ControlNet.cleanup"
+    wrapped_cleanup.__doc__ = (
+        "cplugapi-wrapped ``ControlNet.cleanup``: skips the "
+        "``unload_model`` call for cnets held by the patcher cache "
+        "(tagged with ``_cplug_cache_held``). All other cleanup work "
+        "(cond_hint clear, model_sampling_current reset) still runs."
+    )
+    return wrapped_cleanup
+
+
+def _invoke_cleanup_with_unload_skipped(original_cleanup, self):
+    """Run ``original_cleanup`` with ``memory_management.unload_model``
+    short-circuited to a no-op.
+
+    Why this dance instead of just reimplementing the cleanup logic
+    inline: the original is a small but real function that may evolve
+    upstream (e.g., a future Forge change might add additional cleanup
+    steps inside ``ControlNet.cleanup``). Reimplementing it forks the
+    behavior. Swapping out the single offending symbol — ``unload_model``
+    — keeps us aligned with upstream semantics for everything else.
+
+    The swap is local to this call (try/finally restore) so concurrent
+    cleanups don't see a corrupt module state. Forge's ``queue_lock``
+    serialises gens anyway, but defensive isolation is cheap.
+    """
+    try:
+        from backend import memory_management
+    except Exception:
+        # Backend unreachable (test path). The original cleanup will
+        # also fail, so let it raise normally.
+        return original_cleanup(self)
+
+    sentinel_unload = memory_management.unload_model
+    memory_management.unload_model = _noop_unload
+    try:
+        return original_cleanup(self)
+    finally:
+        # Only restore if our sentinel still in place — a competing
+        # patch in the meantime would have its own value, don't clobber.
+        if memory_management.unload_model is _noop_unload:
+            memory_management.unload_model = sentinel_unload
+
+
+def _noop_unload(model) -> bool:
+    """Drop-in replacement for ``memory_management.unload_model``
+    during cached-cnet cleanup. Returns ``False`` to signal "nothing
+    was unloaded", matching the contract for a model that wasn't in
+    ``current_loaded_models``."""
+    return False
 
 
 def _resolve_target_module():
@@ -532,12 +634,45 @@ def apply(target_module=None) -> bool:
     # log line. See _KNOWN_CONSUMER_MODULES.
     rebound = _rebind_known_consumers(original, wrapped)
 
+    # Sibling patch: skip ``unload_model`` in ``ControlNet.cleanup``
+    # for cnets we hold. Without this the cache is necessary but not
+    # sufficient — sampling_cleanup at end-of-gen still pops the cnet's
+    # wrapped patcher from ``current_loaded_models``, producing a noisy
+    # "Requested to load ControlNet" line on the next gen.
+    cleanup_patched = _patch_controlnet_cleanup(target_module)
+
     _log.info(
-        "cplugapi: patched %s.apply_controlnet_advanced (controlnet patcher cache, %s; rebound %d consumer(s))",
+        "cplugapi: patched %s.apply_controlnet_advanced (controlnet patcher cache, %s; rebound %d consumer(s); cleanup-skip %s)",
         target_module.__name__,
         "enabled" if _emission_enabled else "disabled — passthrough",
         rebound,
+        "installed" if cleanup_patched else "not installed",
     )
+    return True
+
+
+_CLEANUP_PATCHED_FLAG = "_cplugapi_controlnet_cleanup_patched"
+
+
+def _patch_controlnet_cleanup(target_module) -> bool:
+    """Wrap ``ControlNet.cleanup`` on the target module's class.
+
+    Idempotent via ``_CLEANUP_PATCHED_FLAG`` stamped on the class.
+    Returns True iff this call newly installed the wrapper.
+    """
+    cls = getattr(target_module, "ControlNet", None)
+    if cls is None:
+        _log.warning(
+            "cplugapi: %s has no ControlNet class; cleanup-skip not installed",
+            target_module.__name__,
+        )
+        return False
+    if getattr(cls, _CLEANUP_PATCHED_FLAG, False):
+        return False
+
+    original_cleanup = cls.cleanup
+    cls.cleanup = _build_wrapped_cleanup(original_cleanup)
+    setattr(cls, _CLEANUP_PATCHED_FLAG, True)
     return True
 
 

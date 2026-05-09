@@ -550,3 +550,128 @@ def test_install_silent_when_consumer_unloaded(
 
     # Should not raise.
     assert fresh_cache.apply(module) is True
+
+
+# --- ControlNet.cleanup unload-skip tests ---------------------------------
+#
+# Forge's ControlNet.cleanup() at end-of-gen calls
+# memory_management.unload_model on the cnet's control_model_wrapped,
+# popping it from current_loaded_models. The next gen's load_models_gpu
+# lookup misses → "Requested to load ControlNet" log fires. For cnets
+# we hold in cache, that unload is wasted work. The wrapped cleanup
+# skips it for tagged cnets only.
+
+
+def test_cnet_tagged_when_cached(fake_controlnet_module, fresh_cache):
+    """Successful cache install must tag the cnet with
+    ``_cplug_cache_held = True`` so the cleanup wrapper recognises it."""
+    module, _, _, _ = fake_controlnet_module
+    fresh_cache.apply(module)
+
+    unet, cn, _ = _baseline_pair_with_inner_weights()
+    m = module.apply_controlnet_advanced(unet, cn, "img1", 0.5, 0.0, 1.0)
+
+    assert getattr(m.controlnet_linked_list, "_cplug_cache_held", False) is True
+
+
+def test_install_patches_controlnet_cleanup(fake_controlnet_module, fresh_cache):
+    """The install path must wrap ``ControlNet.cleanup`` so cached cnets
+    skip the unload_model call. Idempotent via the class-level flag."""
+    module, _, _, _ = fake_controlnet_module
+
+    class _StubControlNet:
+        """Stand-in for ``backend.patcher.controlnet.ControlNet``. The
+        original ``cleanup`` here is a sentinel we can identify after
+        wrapping."""
+
+        def cleanup(self):
+            return "original_cleanup"
+
+    module.ControlNet = _StubControlNet
+    original_cleanup = _StubControlNet.cleanup
+
+    fresh_cache.apply(module)
+
+    assert _StubControlNet.cleanup is not original_cleanup
+    assert getattr(_StubControlNet, "_cplugapi_controlnet_cleanup_patched", False) is True
+
+    # Second apply on the same module — flag short-circuits, no double-wrap.
+    second_cleanup = _StubControlNet.cleanup
+    fresh_cache.apply(module)
+    assert _StubControlNet.cleanup is second_cleanup
+
+
+def test_wrapped_cleanup_skips_unload_for_tagged_cnet(monkeypatch):
+    """Tagged cnet's cleanup must NOT invoke ``memory_management.unload_model``.
+    Untagged cnet's cleanup invokes it normally."""
+    from modules.cplugapi import controlnet_cache
+
+    # Stub backend.memory_management with an unload_model we can spy on.
+    fake_mm = types.ModuleType("backend.memory_management")
+    unload_calls = []
+
+    def fake_unload(model):
+        unload_calls.append(model)
+        return True
+
+    fake_mm.unload_model = fake_unload
+    monkeypatch.setitem(sys.modules, "backend", types.ModuleType("backend"))
+    monkeypatch.setitem(sys.modules, "backend.memory_management", fake_mm)
+
+    # Original cleanup that calls unload_model — mirroring real
+    # ControlNet.cleanup behaviour.
+    cleanup_calls = []
+
+    def original_cleanup(self):
+        cleanup_calls.append(("super", self))
+        # Mirror real cleanup: unload then super-cleanup work.
+        from backend import memory_management
+        memory_management.unload_model(self.control_model_wrapped)
+
+    wrapped = controlnet_cache._build_wrapped_cleanup(original_cleanup)
+
+    class _Cnet:
+        pass
+
+    untagged = _Cnet()
+    untagged.control_model_wrapped = "wrapped_a"
+    wrapped(untagged)
+    assert unload_calls == ["wrapped_a"]  # untagged: full cleanup ran
+
+    tagged = _Cnet()
+    tagged.control_model_wrapped = "wrapped_b"
+    tagged._cplug_cache_held = True
+    wrapped(tagged)
+    # Tagged: the original cleanup ran, but the unload_model call inside
+    # was short-circuited to a no-op. Original got called (cleanup_calls
+    # grew) but unload_calls didn't grow.
+    assert len(cleanup_calls) == 2
+    assert unload_calls == ["wrapped_a"]  # unchanged from before
+
+
+def test_wrapped_cleanup_restores_unload_after_call(monkeypatch):
+    """The temporary swap of ``memory_management.unload_model`` must be
+    restored after the cleanup call returns — concurrent cleanups (or
+    later non-tagged cleanups) must see the real function."""
+    from modules.cplugapi import controlnet_cache
+
+    fake_mm = types.ModuleType("backend.memory_management")
+    real_unload = lambda m: True  # noqa: E731
+    fake_mm.unload_model = real_unload
+    monkeypatch.setitem(sys.modules, "backend", types.ModuleType("backend"))
+    monkeypatch.setitem(sys.modules, "backend.memory_management", fake_mm)
+
+    def original_cleanup(self):
+        pass
+
+    wrapped = controlnet_cache._build_wrapped_cleanup(original_cleanup)
+
+    class _Cnet:
+        pass
+
+    tagged = _Cnet()
+    tagged._cplug_cache_held = True
+    wrapped(tagged)
+
+    # After the wrapped call, unload_model is back to the real function.
+    assert fake_mm.unload_model is real_unload

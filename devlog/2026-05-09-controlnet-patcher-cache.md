@@ -343,3 +343,71 @@ extend the list. Don't iterate `sys.modules` automatically; the
 explicit list is auditable and survives upstream rebases.
 
 `pytest tests/` → 340 passed, 4 skipped.
+
+## Third follow-up — cleanup() unloads what we just cached
+
+After the consumer-rebind fix landed, KModel detach/reattach and
+"Moving model(s) has taken X seconds" both disappeared from gen 2+.
+But "Requested to load ControlNet" still fired every gen.
+
+Root cause: `backend/patcher/controlnet.py:358-362`
+
+```python
+def cleanup(self):
+    self.model_sampling_current = None
+    if getattr(self, "control_model_wrapped", None) is not None:
+        memory_management.unload_model(self.control_model_wrapped)
+    super().cleanup()
+```
+
+`sampling_cleanup` walks `unet.list_controlnets()` and calls
+`cnet.cleanup()` at the end of every gen. For our cached cnet,
+`unload_model(cnet.control_model_wrapped)` pops it from
+`current_loaded_models`. The next gen's `load_models_gpu` lookup
+misses → "Requested to load ControlNet" log fires → entry
+re-inserted (cheap, no weight movement, but the noise + churn is
+visible).
+
+Fix: monkey-patch `ControlNet.cleanup` to skip the `unload_model`
+call when the cnet carries our `_cplug_cache_held` tag. Untagged
+cnets (non-cached path or competing extensions) clean up normally.
+
+Implementation: rather than reimplement cleanup inline (which would
+fork from any future upstream changes), we temporarily swap
+`memory_management.unload_model` with a no-op while invoking the
+original cleanup, then restore. Try/finally guard around the swap.
+
+Cnet tagging happens at cache-install time:
+```python
+cached_cnet = result.controlnet_linked_list
+if cached_cnet is not None:
+    cached_cnet._cplug_cache_held = True
+```
+
+Boot log now reports both layers:
+```
+cplugapi: patched backend.patcher.controlnet.apply_controlnet_advanced
+(controlnet patcher cache, enabled; rebound 1 consumer(s);
+ cleanup-skip installed)
+```
+
+Four new tests:
+- `test_cnet_tagged_when_cached` — tag attached on install
+- `test_install_patches_controlnet_cleanup` — cleanup wrapper installed,
+  idempotent on re-install
+- `test_wrapped_cleanup_skips_unload_for_tagged_cnet` — tagged cnets
+  skip unload_model; untagged go through normally
+- `test_wrapped_cleanup_restores_unload_after_call` — try/finally
+  restores the symbol so concurrent cleanups don't see corrupt state
+
+`pytest tests/` → 344 passed, 4 skipped.
+
+### Architectural note
+
+The cache is now a two-layer construct: (1) cache the patched UNet
+clone, (2) skip the cleanup unload that would invalidate the cache
+between gens. The two layers are necessary AND sufficient — neither
+alone gets us a quiet log. Future maintainers should treat them as
+a unit; disabling either via `CPLUG_CONTROLNET_CACHE=0` flips both
+back to upstream behaviour (the wrapped cleanup short-circuits when
+emission_enabled is false because the cnet won't carry the tag).
