@@ -342,7 +342,13 @@ def install_hooks() -> None:
                     shared.state.interrupted = True
                 except Exception:
                     pass
-                _log.info("late-abort: task %s preempted before sampling", current)
+                # DEBUG, not INFO — the matching ``preempt fired`` line
+                # already announced the cancellation at request entry,
+                # and the operational signal that the late-abort worked
+                # is "the next gen ran instead of stacking". Kept as
+                # opt-in diagnostic for verifying the hook fires when
+                # debugging interrupt-propagation regressions.
+                _log.debug("late-abort: task %s preempted before sampling", current)
             return original_process(p, *args, **kwargs)
 
         _proc.process_images_inner = wrapped_process_images_inner
