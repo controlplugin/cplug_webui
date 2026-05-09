@@ -160,6 +160,45 @@ def test_exception_in_gen_still_logs_with_error_field(fake_processing, caplog_ge
     assert "error=BoomError" in records[0].getMessage()
 
 
+def test_peak_vram_logged_when_cuda_available(fake_processing, caplog_gen, monkeypatch):
+    """When CUDA is reachable, every gen line carries peak_vram_mb so the
+    operator can spot Sysmem-Fallback territory (peak near total VRAM)."""
+    import sys
+    import types
+
+    fake_torch = types.ModuleType("torch")
+    fake_cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        reset_peak_memory_stats=lambda: None,
+        max_memory_allocated=lambda: 12345 * 1024 * 1024,  # 12345 MiB
+    )
+    fake_torch.cuda = fake_cuda
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    fake_processing.process_images_inner("p")
+    records = _gen_records(caplog_gen)
+    assert len(records) == 1
+    assert getattr(records[0], "peak_vram_mb", None) == 12345.0
+    assert "peak_vram_mb=12345.0" in records[0].getMessage()
+
+
+def test_peak_vram_omitted_when_cuda_absent(fake_processing, caplog_gen, monkeypatch):
+    """CPU-only deployments (and tests) shouldn't pretend to know peak
+    VRAM. The line still emits, just without the field."""
+    import sys
+    import types
+
+    fake_torch = types.ModuleType("torch")
+    fake_torch.cuda = types.SimpleNamespace(is_available=lambda: False)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    fake_processing.process_images_inner("p")
+    records = _gen_records(caplog_gen)
+    assert len(records) == 1
+    assert getattr(records[0], "peak_vram_mb", None) is None
+    assert "peak_vram_mb" not in records[0].getMessage()
+
+
 def test_capability_registered(progress_stub, clean_capabilities):
     """``gen-timing`` must appear in /health.capabilities so clients
     know to look for the timing log lines."""

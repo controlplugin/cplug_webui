@@ -32,10 +32,17 @@ naturally invalidates via the key. (`modules/sd_models.py`)
 `cplugapi.gen_timing` logger emits one structured line per
 `process_images_inner` call: `total_ms` for end-to-end, `vae_decode_ms`
 summed across `decode_latent_batch` calls (HR-pass accumulates),
-plus an `error=<ExceptionName>` field on raised gens. Joined to the
-sampler's existing tqdm time, the residual is pre-sampling cost
-(conditioning, init prep, kernel JIT) — the bucket that grows when
-models are evicted/reloaded between gens.
+`peak_vram_mb` for the per-gen VRAM watermark (reset before each
+gen), plus an `error=<ExceptionName>` field on raised gens. Joined
+to the sampler's existing tqdm time, the residual of `total_ms` is
+pre-sampling cost (conditioning, init prep, kernel JIT) — the bucket
+that grows when models are evicted/reloaded between gens.
+
+`peak_vram_mb` is the diagnostic for "is the NVIDIA driver silently
+spilling VRAM to shared memory over PCIe?" — when peak approaches
+total VRAM during sampling, sysmem fallback may engage and slow the
+gen by 10-20×. Disable via NVIDIA Control Panel → CUDA - Sysmem
+Fallback Policy → "Prefer No Sysmem Fallback".
 
 Read-only wrap on upstream functions; never mutates response bytes
 so `/sdapi/v1/*` byte-identity holds. Idempotent install. Capability

@@ -93,6 +93,7 @@ Fields:
 |---|---|
 | `total_ms` | Wall-clock from the start of `process_images_inner` to its return (or exception). Includes conditioning prep, sampling, VAE decode, save. |
 | `vae_decode_ms` | Sum of time spent in `decode_latent_batch` for this gen. HR-pass calls accumulate. |
+| `peak_vram_mb` | Peak CUDA memory allocated during the gen, in MiB. Reset before each gen so the value is per-gen, not cumulative. Omitted when CUDA isn't reachable. **Watch this number** — when it approaches your card's total VRAM, the NVIDIA driver may silently spill to shared memory (PCIe), causing 10-20× slowdown. Disable via NVIDIA Control Panel → CUDA - Sysmem Fallback Policy → "Prefer No Sysmem Fallback". |
 | `error=<ExceptionName>` | Set when the gen raised; the line still emits so failed gens are visible. |
 
 The hook installs at cplugapi mount time as an in-place wrap on the

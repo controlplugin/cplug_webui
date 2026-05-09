@@ -59,11 +59,44 @@ _INSTALL_FLAG = "_cplug_gen_timing_installed"
 _install_lock = threading.Lock()
 
 
+def _reset_peak_vram() -> None:
+    """Reset the CUDA peak-allocated counter so the next gen records its
+    own watermark, not the running max-of-all-time. Best-effort: torch
+    may be unavailable (test env) or CUDA may not be active (CPU mode);
+    in both cases the call is a silent no-op so timing still works.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+
+
+def _peak_vram_mb() -> Optional[float]:
+    """Return peak VRAM allocated since the last reset, in MiB.
+
+    Diagnostic for "is CUDA Sysmem Fallback firing?" — if peak hits
+    near total VRAM during sampling, the NVIDIA driver is silently
+    spilling tensors over PCIe to host RAM, and the iteration time
+    will be 10-20x slower than expected. ``None`` when CUDA is not
+    available so log readers can distinguish "not measured" from "0".
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        return torch.cuda.max_memory_allocated() / (1024 * 1024)
+    except Exception:
+        return None
+
+
 def _start_gen_record() -> dict:
     """Initialise a fresh per-gen timing dict and bind it to the context.
 
     Returns the dict so the wrapper can read ``start`` from it.
     """
+    _reset_peak_vram()
     record = {"start": time.perf_counter(), "stages": {}}
     return record
 
@@ -72,11 +105,14 @@ def _emit(record: dict, error: Optional[str] = None) -> None:
     """Format + log one structured line for the completed gen."""
     total_ms = (time.perf_counter() - record["start"]) * 1000.0
     stages: dict[str, float] = record["stages"]
+    peak_vram = _peak_vram_mb()
 
     extra: dict[str, Any] = {
         "total_ms": round(total_ms, 1),
         **{f"{name}_ms": round(value, 1) for name, value in stages.items()},
     }
+    if peak_vram is not None:
+        extra["peak_vram_mb"] = round(peak_vram, 1)
     if error is not None:
         extra["error"] = error
 
@@ -84,6 +120,8 @@ def _emit(record: dict, error: Optional[str] = None) -> None:
         f"{name}_ms={value:.1f}" for name, value in stages.items()
     )
     suffix = f" {rendered_stages}" if rendered_stages else ""
+    if peak_vram is not None:
+        suffix += f" peak_vram_mb={peak_vram:.1f}"
     if error is not None:
         suffix += f" error={error}"
 
