@@ -7,6 +7,26 @@ grouped by **Added / Changed / Fixed / Removed**.
 
 ## Unreleased
 
+### Fixed — TOCTOU race in TAESD / VAEApprox live-preview downloads
+
+Two concurrent generations both triggering live-preview decoder
+download to the same path would each call
+`torch.hub.download_url_to_file(url, path)` after both had already
+seen `os.path.exists(path) == False`. The two writes interleaved on
+the same file descriptor, producing a torn `.pth` that failed the
+next `torch.load` with `PytorchStreamReader failed reading file
+data/N`. Forge then renamed the file to `.corrupted`, leaving the
+second consumer with `FileNotFoundError`.
+
+Both `modules/sd_vae_taesd.py` and `modules/sd_vae_approx.py` now
+serialise downloads of the same path through a per-path
+`threading.Lock` (different paths still parallelise) and publish
+atomically — the network write goes to a `.part` sibling, then
+`os.replace` swings the final path into place. A crash mid-download
+leaves only an orphan `.part`; the next call still sees the canonical
+path absent and re-downloads cleanly. (`modules/sd_vae_taesd.py`,
+`modules/sd_vae_approx.py`)
+
 ### Added — per-request access log for `/cplugapi/v1/*`
 
 One structured line per request emitted to the `cplugapi.access`

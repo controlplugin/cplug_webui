@@ -1,4 +1,5 @@
 import os
+import threading
 from functools import lru_cache
 
 import torch
@@ -33,12 +34,38 @@ class VAEApprox(nn.Module):
         return x
 
 
-def download_model(model_path, model_url):
-    if not os.path.exists(model_path):
-        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+# cplug fork: same TOCTOU-race fix as sd_vae_taesd.download_model.
+# Two concurrent live-preview consumers can race on a fresh download
+# and produce a torn file; per-path lock + atomic .part rename closes
+# the window without changing the call site contract.
+_download_locks: dict[str, threading.Lock] = {}
+_download_locks_guard = threading.Lock()
 
-        print(f"Downloading VAEApprox model to: {model_path}")
-        torch.hub.download_url_to_file(model_url, model_path)
+
+def _lock_for_path(path: str) -> threading.Lock:
+    key = os.path.abspath(path)
+    with _download_locks_guard:
+        return _download_locks.setdefault(key, threading.Lock())
+
+
+def download_model(model_path, model_url):
+    path = os.fspath(model_path)
+    lock = _lock_for_path(path)
+    with lock:
+        if os.path.exists(path):
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        print(f"Downloading VAEApprox model to: {path}")
+        tmp_path = path + ".part"
+        try:
+            torch.hub.download_url_to_file(model_url, tmp_path)
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
 
 
 def model():

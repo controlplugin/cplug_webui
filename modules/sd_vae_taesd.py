@@ -9,6 +9,7 @@
 # - https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/taesd/taehv.py
 
 import os
+import threading
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -196,11 +197,55 @@ class TAEHVDecoder(nn.Module):
         return z.squeeze(1)
 
 
+# cplug fork: per-path locks + atomic write to defeat the TOCTOU race
+# when two concurrent generations both trigger a fresh TAESD download.
+# Upstream's exists()-then-write pattern lets two threads truncate the
+# same path simultaneously, producing a torn file that fails torch.load
+# with PytorchStreamReader errors. Forge then renames the corrupted
+# file out from under the second consumer, cascading the failure.
+_download_locks: dict[str, threading.Lock] = {}
+_download_locks_guard = threading.Lock()
+
+
+def _lock_for_path(path: str) -> threading.Lock:
+    """Return a stable lock instance per absolute path. Two callers
+    asking for the same path receive the same Lock so concurrent
+    download attempts serialise."""
+    key = os.path.abspath(path)
+    with _download_locks_guard:
+        return _download_locks.setdefault(key, threading.Lock())
+
+
 def download_model(model_path: os.PathLike, model_url: str):
-    if not os.path.exists(model_path):
-        os.makedirs(os.path.dirname(model_path), exist_ok=True)
-        print(f'Downloading TAESD Model to: "{model_path}"...')
-        torch.hub.download_url_to_file(model_url, model_path)
+    path = os.fspath(model_path)
+    lock = _lock_for_path(path)
+    with lock:
+        # Re-check existence under the lock — the previous holder may
+        # have just produced the file. The first thread downloads, the
+        # second falls through to a no-op.
+        if os.path.exists(path):
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        print(f'Downloading TAESD Model to: "{path}"...')
+        # Atomic publish: write to ``.part`` then rename. If a crash
+        # leaves ``.part`` orphaned, the next call still sees the real
+        # path absent and re-downloads cleanly. ``os.replace`` is atomic
+        # on POSIX and on NTFS for same-volume renames (which is the
+        # case here — both paths share the parent dir).
+        tmp_path = path + ".part"
+        try:
+            torch.hub.download_url_to_file(model_url, tmp_path)
+            os.replace(tmp_path, path)
+        except BaseException:
+            # On any failure (KeyboardInterrupt included), best-effort
+            # cleanup of the partial file so a retry isn't blocked by
+            # a stale ``.part`` that ``download_url_to_file`` may have
+            # left behind.
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
 
 
 def decoder_model():
