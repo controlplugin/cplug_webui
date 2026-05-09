@@ -16,6 +16,7 @@ from . import (
     active_model,
     architectures,
     capabilities,
+    gen_timing,
     health,
     identify,
     idempotency,
@@ -52,6 +53,7 @@ def _register_capabilities() -> None:
     livez_readyz.register_capabilities()
     queue_endpoint.register_capabilities()
     access_log.register_capabilities()
+    gen_timing.register_capabilities()
     # Model arch detection (/v1/models/*).
     active_model.register_capabilities()
     sd_checkpoints.register_capabilities()
@@ -79,6 +81,7 @@ def setup_cplugapi(
             return
 
         runtime.apply_runtime_tweaks()
+        gen_timing.install_hooks()
         _install_middlewares(app)
         _do_mount(app, auth_dependency)
         setattr(app.state, _MOUNT_FLAG, True)
