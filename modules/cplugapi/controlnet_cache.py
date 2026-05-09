@@ -67,16 +67,38 @@ the per-gen state in place on the cached ``cnet``.
 Cache design
 ------------
 
-* **Key**: ``(id(unet_baseline), id(controlnet_baseline))``. The baselines
-  are the BEFORE-clone inputs to ``apply_controlnet_advanced``. They
-  change whenever:
+* **Key**: ``(id(unet_baseline), _stable_controlnet_id(controlnet))``. The
+  unet identity is stable across gens because Forge resets
+  ``forge_objects.unet`` to the LoRA-applied snapshot at the start of
+  each gen, AND our sibling ToMe cache (``modules/sd_models.py:apply_token_merging``)
+  returns the same patched clone instance on hit. So ``id(forge_objects.unet)``
+  agrees across gens.
+
+  ``controlnet`` is trickier. Forge's controlnet integration layer
+  (``extensions-builtin/sd_forge_controlnet/scripts/controlnet.py:378``)
+  calls ``try_load_supported_control_model`` every gen, which calls
+  ``try_build_from_state_dict`` (``modules_forge/supported_controlnet.py:80,203``)
+  and returns a FRESH ``ControlNet`` / ``ControlLora`` / ``T2IAdapter``
+  wrapper every time. The underlying weights (cldm.ControlNet) ARE
+  cached in ``_CONTROL_MODEL_CACHE`` keyed on ``ckpt_path``, but the
+  wrapper around them is new per gen — so ``id(controlnet)`` is unstable
+  and would miss the cache every gen.
+
+  :func:`_stable_controlnet_id` walks to the inner cached weights model
+  (``controlnet.control_model`` / ``controlnet.control_weights`` /
+  ``controlnet.t2i_model`` depending on subclass) and uses ITS id. That
+  is the truly stable identity — same across gens for as long as the
+  user doesn't swap ControlNet checkpoint.
+
+  Both keys change in the right places:
 
     - LoRA application rebuilds ``forge_objects_after_applying_lora.unet``
       — new ``id()`` for the unet baseline → cache miss → fresh patch.
-    - The user swaps checkpoint or ControlNet model — same.
+    - The user swaps checkpoint or ControlNet model — the inner weights
+      object identity changes (different cldm.ControlNet instance) → miss.
     - The user adds another ControlNet to the stack — the first call's
       output becomes the second call's ``unet`` argument, so its key is
-      ``(id(m_with_cn1), id(cn2))`` — distinct from a single-CN call.
+      ``(id(m_with_cn1), inner_id(cn2))`` — distinct from a single-CN call.
       Stacked CNs work correctly without special-casing.
 
 * **Value**: the cached cloned UNet patcher (``m``) plus a weakref guard
@@ -154,36 +176,50 @@ class _CacheEntry:
 
     The weakrefs let us detect ``id()`` reuse: Python recycles the
     integer id of a GC'd object, so a stale key could otherwise serve
-    a wrong cached value. Holding a weakref to the baseline lets us
+    a wrong cached value. Holding a weakref to the baselines lets us
     verify ``weak() is current_baseline`` on lookup; mismatch means
     the original baseline is gone and the entry is stale.
+
+    Note: the controlnet weakref points at the INNER weights object
+    (cldm.ControlNet / control_weights dict / t2i_model), not at the
+    wrapper. The wrapper is rebuilt per gen by Forge so it would die
+    immediately and the entry would never serve a hit. The inner
+    weights are cached in ``_CONTROL_MODEL_CACHE`` and persist for the
+    fork's lifetime.
     """
 
-    __slots__ = ("unet_ref", "controlnet_ref", "cached_unet")
+    __slots__ = ("unet_ref", "controlnet_inner_ref", "cached_unet")
 
-    def __init__(self, unet, controlnet, cached_unet):
+    def __init__(self, unet, controlnet_inner, cached_unet):
         # weakref.ref may raise TypeError for a few exotic types
         # (instances of classes without __weakref__ slot). UnetPatcher
-        # and ControlNet don't have that constraint, but defend anyway:
-        # if the weakref can't be created, the entry is unusable —
-        # caller falls back to fresh patch.
+        # and cldm.ControlNet don't have that constraint, but defend
+        # anyway: if the weakref can't be created, the entry is
+        # unusable — caller falls back to fresh patch. ``control_weights``
+        # for ControlLora is a plain dict which doesn't support
+        # weakref; in that case ``_safe_ref`` returns None and the
+        # entry is treated as immediately stale (no caching for that
+        # subclass — acceptable correctness/perf tradeoff).
         self.unet_ref = _safe_ref(unet)
-        self.controlnet_ref = _safe_ref(controlnet)
+        self.controlnet_inner_ref = _safe_ref(controlnet_inner)
         # Strong reference. Keeps the cached patched UNet alive across
         # gens; Forge's memory_management may still evict its weights
         # from VRAM under pressure, but the patcher object stays in
         # ``current_loaded_models`` and the equality lookup hits.
         self.cached_unet = cached_unet
 
-    def is_alive(self, unet, controlnet) -> bool:
+    def is_alive(self, unet, controlnet_inner) -> bool:
         """True iff both baselines are still the same objects we cached.
 
         ``id()`` keys can collide after GC; the weakref pair guarantees
         we only serve a hit when the original objects are reachable.
         """
-        if self.unet_ref is None or self.controlnet_ref is None:
+        if self.unet_ref is None or self.controlnet_inner_ref is None:
             return False
-        return self.unet_ref() is unet and self.controlnet_ref() is controlnet
+        return (
+            self.unet_ref() is unet
+            and self.controlnet_inner_ref() is controlnet_inner
+        )
 
 
 def _safe_ref(obj) -> Optional["weakref.ReferenceType"]:
@@ -191,6 +227,47 @@ def _safe_ref(obj) -> Optional["weakref.ReferenceType"]:
         return weakref.ref(obj)
     except TypeError:
         return None
+
+
+# Field names checked in priority order to find the stable inner-weights
+# identity for the controlnet wrapper. ``ControlNet`` exposes
+# ``control_model`` (the cldm.ControlNet from _CONTROL_MODEL_CACHE);
+# ``ControlLora`` and ``T2IAdapter`` expose their own equivalents. Order
+# matters only for performance (most common subclass first).
+_CONTROLNET_INNER_FIELDS: tuple[str, ...] = (
+    "control_model",   # ControlNet
+    "control_weights", # ControlLora
+    "t2i_model",       # T2IAdapter
+)
+
+
+def _resolve_controlnet_inner(controlnet):
+    """Return the cached inner-weights object backing ``controlnet``.
+
+    Forge rebuilds the ``ControlNet`` / ``ControlLora`` / ``T2IAdapter``
+    wrapper every gen via ``try_build_from_state_dict``, even when the
+    underlying weights come from ``_CONTROL_MODEL_CACHE``. Keying our
+    cache on the wrapper would miss every gen.
+
+    Walk to the cached inner-weights object instead. Falls back to
+    ``controlnet`` itself when no known field matches — for unknown
+    subclasses that's equivalent to no caching (the wrapper dies
+    immediately and ``is_alive()`` rejects the entry), which is the
+    correct conservative behaviour for an unrecognised type.
+    """
+    for field in _CONTROLNET_INNER_FIELDS:
+        weights = getattr(controlnet, field, None)
+        if weights is not None:
+            return weights
+    return controlnet
+
+
+def _stable_controlnet_id(controlnet) -> int:
+    """``id()`` of the inner-weights object — kept as a separate helper
+    so external code (tests, future capability probes) can introspect
+    the key strategy without needing the wrapper.
+    """
+    return id(_resolve_controlnet_inner(controlnet))
 
 
 def _is_enabled() -> bool:
@@ -297,10 +374,16 @@ def _build_wrapped_apply(original):
                 control_type=control_type,
             )
 
-        key = (id(unet), id(controlnet))
+        # Walk to the cached inner-weights object — the controlnet
+        # wrapper itself is rebuilt every gen by
+        # ``try_build_from_state_dict``, but the inner weights come from
+        # ``_CONTROL_MODEL_CACHE`` and are stable across gens. See
+        # :func:`_stable_controlnet_id` for the field-walk rationale.
+        controlnet_inner = _resolve_controlnet_inner(controlnet)
+        key = (id(unet), id(controlnet_inner))
         with _cache_lock:
             entry = _cache.get(key)
-            if entry is not None and entry.is_alive(unet, controlnet):
+            if entry is not None and entry.is_alive(unet, controlnet_inner):
                 # Cache hit. Mutate the cnet already linked into the
                 # cached patcher's controlnet_linked_list. The list
                 # head is the cnet we attached during the first patch
@@ -350,7 +433,7 @@ def _build_wrapped_apply(original):
         )
 
         with _cache_lock:
-            _cache[key] = _CacheEntry(unet, controlnet, result)
+            _cache[key] = _CacheEntry(unet, controlnet_inner, result)
             _evict_one_if_needed()
 
         return result

@@ -130,11 +130,50 @@ class _Baseline:
         self.name = name
 
 
+class _ControlNetWrapper:
+    """Stand-in for Forge's ``ControlNet`` patcher (NOT the cldm one).
+
+    Forge rebuilds this wrapper every gen via ``try_build_from_state_dict``,
+    but the inner ``control_model`` (cldm.ControlNet weights) is cached
+    in ``_CONTROL_MODEL_CACHE``. The cache key strategy walks to
+    ``control_model`` for stability — this fixture lets us exercise that
+    path."""
+
+    def __init__(self, control_model):
+        self.control_model = control_model
+
+
 def _baseline_pair():
     """Return a (baseline_unet, baseline_controlnet) pair that survives
     GC for the test's lifetime. The cache uses ``id(...)`` keys plus
-    weakrefs — both args must outlive the test scope."""
+    weakrefs — both args must outlive the test scope.
+
+    The controlnet baseline is a plain ``_Baseline`` object (no inner
+    ``control_model`` field) so the cache falls back to keying on the
+    wrapper itself — covers the unknown-subclass codepath. Tests that
+    exercise the production wrapper-vs-weights split use
+    ``_baseline_pair_with_inner_weights``.
+    """
     return _Baseline("unet_baseline"), _Baseline("cn_baseline")
+
+
+def _baseline_pair_with_inner_weights(shared_weights=None):
+    """Return (unet, ControlNet-wrapper-with-shared-inner-weights).
+
+    Mirrors the production bug: Forge's ``try_load_supported_control_model``
+    returns a fresh wrapper every gen but the inner cldm weights come
+    from ``_CONTROL_MODEL_CACHE``. The cache key must stabilize on the
+    inner weights so back-to-back gens hit even though the wrapper id
+    differs.
+
+    Pass an existing ``shared_weights`` to simulate two gens sharing
+    the same inner cldm.ControlNet (the production happy path); pass
+    ``None`` to allocate a fresh one.
+    """
+    unet = _Baseline("unet_baseline")
+    if shared_weights is None:
+        shared_weights = _Baseline("cn_inner_weights")
+    return unet, _ControlNetWrapper(shared_weights), shared_weights
 
 
 def test_first_call_misses_and_invokes_original(
@@ -345,3 +384,88 @@ def test_capability_omitted_when_disabled(
     monkeypatch.setenv("CPLUG_CONTROLNET_CACHE", "0")
     fresh_cache.register_capabilities()
     assert "controlnet/patcher-cache" not in clean_capabilities.enabled_capabilities()
+
+
+# --- regression: cache key stability across rebuilt wrappers --------------
+#
+# Real-world bug observed on the test rig: Forge's controlnet integration
+# (``extensions-builtin/sd_forge_controlnet/scripts/controlnet.py:378``)
+# calls ``try_load_supported_control_model`` every gen, returning a FRESH
+# ``ControlNet`` wrapper. The underlying cldm weights are cached in
+# ``_CONTROL_MODEL_CACHE``, but the wrapper isn't. Naive ``id(controlnet)``
+# keying misses every gen → cache never hits in production. The fix walks
+# to the inner ``control_model`` for the stable identity.
+
+
+def test_fresh_wrapper_around_shared_weights_hits_cache(
+    fake_controlnet_module, fresh_cache,
+):
+    """The production happy path: two consecutive gens see two different
+    ControlNet wrapper instances backing the same inner weights. Cache
+    must hit on the second gen — that's the entire reason we walk to
+    ``control_model`` for the key."""
+    module, counters, _, _ = fake_controlnet_module
+    fresh_cache.apply(module)
+
+    unet, cn_gen1, shared_weights = _baseline_pair_with_inner_weights()
+    m1 = module.apply_controlnet_advanced(unet, cn_gen1, "img1", 0.5, 0.0, 1.0)
+
+    # Second "gen": Forge rebuilt the wrapper but reused the cached
+    # cldm weights. Different id(controlnet), same id(control_model).
+    _, cn_gen2, _ = _baseline_pair_with_inner_weights(shared_weights=shared_weights)
+    assert cn_gen1 is not cn_gen2
+    assert cn_gen1.control_model is cn_gen2.control_model
+
+    m2 = module.apply_controlnet_advanced(unet, cn_gen2, "img2", 0.7, 0.0, 1.0)
+
+    assert m1 is m2  # cache hit — same patched UNet returned
+    assert counters["original_calls"] == 1
+
+
+def test_different_inner_weights_do_not_collide(
+    fake_controlnet_module, fresh_cache,
+):
+    """Inverse of the above: same wrapper class, DIFFERENT inner weights
+    (e.g., user swapped the ControlNet checkpoint mid-session). Must NOT
+    hit cache."""
+    module, counters, _, _ = fake_controlnet_module
+    fresh_cache.apply(module)
+
+    unet, cn_a, _ = _baseline_pair_with_inner_weights()
+    unet2, cn_b, _ = _baseline_pair_with_inner_weights()  # different inner
+
+    m1 = module.apply_controlnet_advanced(unet, cn_a, "img", 0.5, 0.0, 1.0)
+    m2 = module.apply_controlnet_advanced(unet, cn_b, "img", 0.5, 0.0, 1.0)
+
+    assert m1 is not m2
+    assert counters["original_calls"] == 2
+
+
+def test_resolves_control_weights_field_for_controllora():
+    """ControlLora subclass exposes ``control_weights`` instead of
+    ``control_model`` — the resolver must walk to it."""
+    from modules.cplugapi.controlnet_cache import _resolve_controlnet_inner
+
+    weights = _Baseline("controllora_weights")
+    wrapper = types.SimpleNamespace(control_weights=weights)
+    assert _resolve_controlnet_inner(wrapper) is weights
+
+
+def test_resolves_t2i_model_field_for_t2iadapter():
+    """T2IAdapter subclass exposes ``t2i_model``."""
+    from modules.cplugapi.controlnet_cache import _resolve_controlnet_inner
+
+    weights = _Baseline("t2i_weights")
+    wrapper = types.SimpleNamespace(t2i_model=weights)
+    assert _resolve_controlnet_inner(wrapper) is weights
+
+
+def test_resolves_falls_back_to_wrapper_for_unknown_subclass():
+    """Unknown subclass with no recognised field — resolver returns the
+    wrapper itself. The cache will then key on it (same as pre-fix
+    behaviour) which means cache effectively disabled for that
+    subclass — the conservative correct outcome."""
+    from modules.cplugapi.controlnet_cache import _resolve_controlnet_inner
+
+    wrapper = types.SimpleNamespace(some_other_field="x")
+    assert _resolve_controlnet_inner(wrapper) is wrapper

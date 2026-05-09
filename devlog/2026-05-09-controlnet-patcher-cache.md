@@ -227,3 +227,51 @@ now succeeds and the load path doesn't fire its info-level
 
 `pytest tests/` → 332 passed, 4 skipped (unchanged skip count —
 torch-dependent `pickle_factory` cases).
+
+## Follow-up — cache key was missing in production
+
+Initial implementation keyed on `(id(unet), id(controlnet))`. The fix
+worked in isolation but missed every gen in production: `controlnet`
+is a fresh `ControlNet` wrapper each gen because Forge's controlnet
+integration layer
+(`extensions-builtin/sd_forge_controlnet/scripts/controlnet.py:378`)
+calls `try_load_supported_control_model` per gen, which calls
+`try_build_from_state_dict` (`modules_forge/supported_controlnet.py:80,203`)
+and returns a brand-new wrapper. The underlying `cldm.ControlNet`
+weights ARE cached in `_CONTROL_MODEL_CACHE`, but the wrapper around
+them isn't.
+
+Symptom in the live log:
+
+```
+preempt fired: ...
+Reusing ControlNet Model...
+ControlNet Method None patched.
+Requested to load ControlNet
+Requested to load KModel
+loaded completely; ... 2396.80 MB loaded, full load: True
+Moving model(s) has taken 1.19 seconds
+```
+
+The triplet still fired on every subsequent gen even with the cache
+"installed".
+
+Fix: walk to the inner-weights identity. Each subclass exposes a
+different field — `ControlNet.control_model`, `ControlLora.control_weights`,
+`T2IAdapter.t2i_model`. New helper `_resolve_controlnet_inner` checks
+those in order and falls back to the wrapper for unknown subclasses
+(equivalent to disabled cache for that path — conservative).
+
+Cache key updated to `(id(unet), id(_resolve_controlnet_inner(controlnet)))`.
+`_CacheEntry` now weakrefs the inner-weights object instead of the
+wrapper, so the entry's `is_alive()` check stays valid across rebuilt
+wrappers.
+
+Regression tests added:
+- `test_fresh_wrapper_around_shared_weights_hits_cache` — the actual
+  production scenario.
+- `test_different_inner_weights_do_not_collide` — guards against the
+  inverse failure (wrong cache hit on checkpoint swap).
+- Three resolver tests for the per-subclass field paths.
+
+`pytest tests/` → 337 passed, 4 skipped.
