@@ -21,6 +21,7 @@ from . import (
     health,
     identify,
     idempotency,
+    auto_preempt,
     livez_readyz,
     preset,
     queue_endpoint,
@@ -59,6 +60,7 @@ def _register_capabilities() -> None:
     access_log.register_capabilities()
     gen_timing.register_capabilities()
     sdapi_observer.register_capabilities()
+    auto_preempt.register_capabilities()
     # Model arch detection (/v1/models/*).
     active_model.register_capabilities()
     sd_checkpoints.register_capabilities()
@@ -125,6 +127,14 @@ def _install_middlewares(app: FastAPI) -> None:
     request_id.install(app)
     security_middleware.install(app)
     access_log.install(app)
+    # Auto-preempt: cancels the running gen + drains queue when an
+    # incoming /sdapi/v1/{txt2img,img2img} arrives. Mode-driven via
+    # CPLUG_PREEMPT_MODE (default: ``always`` — see auto_preempt.py).
+    # Pure ASGI, doesn't share BaseHTTPMiddleware's streaming-response
+    # footgun. Installed BEFORE sdapi_observer so the observer's
+    # dur_ms reflects the actual time the client experienced
+    # (preempt-wait + sample + decode), not just sample+decode.
+    auto_preempt.install(app)
     # /sdapi/v1/* observer — pure ASGI, doesn't share BaseHTTPMiddleware's
     # streaming-response footgun. Installed last so it runs FIRST in the
     # chain (Starlette runs most-recently-added first), giving its

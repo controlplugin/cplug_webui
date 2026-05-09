@@ -77,6 +77,34 @@ Set `CPLUG_ACCESS_LOG=0` (or `false`/`no`/`off`) to disable emission;
 the middleware still installs but skips the format step. Capability
 string: `request-log`.
 
+## Auto-preempt on `/sdapi/v1/{txt2img,img2img}`
+
+Pure-ASGI middleware that fires `shared.state.interrupt()` and clears
+the pending queue **before forwarding** an incoming generation
+request to Forge's handler. Cancels the running gen + drains queued
+gens so rapid sketch strokes don't stack up. The new gen waits ~1
+sample step on Forge's `queue_lock` while the cancelled gen exits,
+then runs normally.
+
+Mode-driven via `CPLUG_PREEMPT_MODE`:
+
+| Mode | Behavior | When to use |
+|---|---|---|
+| `always` (default) | Every gen request preempts the running task | Sketch workflows where the most recent stroke is the one that matters — fork's intended default |
+| `header` | Only when `X-Cplug-Preempt: 1` (or `true` / `yes` / `on`) is on the request | Per-request opt-in; client can mark previews as preemptive and final renders as terminal |
+| `off` | Pure passthrough, never preempts | Use when the fork default conflicts with another workflow; equivalent to upstream behavior |
+
+Read once at install time — operators tweaking the mode need to
+restart the webui. Invalid values fall back to the default with a
+warning so typos don't silently disable the feature.
+
+Capability strings: `sdapi/preempt` (build supports it at all) plus
+`sdapi/preempt-<mode>` (active mode). Off-mode advertises neither.
+
+Read-only on the upstream surface: when no preempt fires, the
+middleware is a straight pass-through. Preserves byte-identity on
+`/sdapi/v1/*`.
+
 ## sdapi request log
 
 Pure-ASGI observer wrapped around `/sdapi/v1/*` (the surface the
@@ -405,6 +433,8 @@ models/architectures-available
 request-log
 gen-timing
 sdapi-request-log
+sdapi/preempt
+sdapi/preempt-<mode>
 ```
 
 ## Environment variables
@@ -418,6 +448,7 @@ sdapi-request-log
 | `CPLUG_IDEMPOTENCY_TTL_S` | `86400` (24 h) | idempotency cache |
 | `CPLUG_MODELS_CACHE_MAX` | `4096` | model arch cache |
 | `CPLUG_ACCESS_LOG` | enabled | per-request access log (set `0` to disable) |
+| `CPLUG_PREEMPT_MODE` | `always` | auto-preempt on `/sdapi/v1/{txt2img,img2img}` — `always` / `header` / `off` |
 | `CPLUG_FORK_COMMIT` | `unknown` | `__version__` (CI) |
 | `CPLUG_UPSTREAM_COMMIT` | `unknown` | `__version__` (CI) |
 | `CPLUG_FORK_BUILD_DATE` | process start (UTC ISO-8601) | `__version__` (CI) |

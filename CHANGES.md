@@ -7,6 +7,33 @@ grouped by **Added / Changed / Fixed / Removed**.
 
 ## Unreleased
 
+### Added — auto-preempt for `/sdapi/v1/{txt2img,img2img}`
+
+Pure-ASGI middleware that fires `shared.state.interrupt()` and drains
+the pending queue **before forwarding** incoming gen requests to
+Forge's handler. Cancels the running gen + clears queued gens so
+rapid sketch strokes from the desktop client stop stacking up
+behind one another.
+
+Mode-driven via `CPLUG_PREEMPT_MODE`:
+- `always` (fork default) — every gen request preempts. Best for
+  live-preview sketch workflows where the most recent stroke is
+  the one that matters.
+- `header` — only when `X-Cplug-Preempt: 1` is set; per-request
+  opt-in for clients that want to mark some gens as terminal.
+- `off` — pure passthrough, equivalent to upstream behavior.
+
+Pre-handler ordering: by the time Forge's handler tries to acquire
+`queue_lock`, the previously-running gen has been told to stop.
+The new gen waits ~1 sample step (~80 ms) for the cancelled gen to
+notice `state.interrupted` and exit, then runs normally.
+
+Read-only on the upstream surface — when no preempt fires, pure
+passthrough. Capability advertises mode (`sdapi/preempt-always` /
+`sdapi/preempt-header`) so clients can detect active behavior
+without a config endpoint round-trip.
+(`modules/cplugapi/auto_preempt.py`)
+
 ### Added — `POST /cplugapi/v1/session/preempt`
 
 Cancel-without-knowing-the-id companion to `/session/cancel/{id_task}`.
