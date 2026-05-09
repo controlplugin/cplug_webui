@@ -7,6 +7,52 @@ grouped by **Added / Changed / Fixed / Removed**.
 
 ## Unreleased
 
+### Fixed — `apply_token_merging` cloned the UnetPatcher every gen
+
+Forge's design has `TomePatcher.patch` deep-clone the UnetPatcher
+and attach attn1 patches, returning a new patcher instance. The
+fresh clone never `__eq__`s the patcher already loaded, so
+`load_models_gpu` (`backend/memory_management.py:626-650`) takes the
+`is_clone` branch every generation: pop the previously-loaded
+patcher, detach its patches, attach to the new clone. Side effects:
+
+- `Requested to load KModel` logs every single gen even though no
+  weights actually move.
+- ~0.7s wasted per gen rebinding patches.
+
+The fork now caches the patched UnetPatcher per `(LoRA-baseline-id,
+ratio)`. Stable LoRA + stable ratio (the sketch workflow) → cache
+hit → cached patcher reassigned directly to `forge_objects.unet`,
+so the `__eq__` check in `load_models_gpu` matches and the
+unload/reload path is skipped entirely. LoRA change or ratio change
+naturally invalidates via the key. (`modules/sd_models.py`)
+
+### Added — generation pipeline timing log
+
+`cplugapi.gen_timing` logger emits one structured line per
+`process_images_inner` call: `total_ms` for end-to-end, `vae_decode_ms`
+summed across `decode_latent_batch` calls (HR-pass accumulates),
+plus an `error=<ExceptionName>` field on raised gens. Joined to the
+sampler's existing tqdm time, the residual is pre-sampling cost
+(conditioning, init prep, kernel JIT) — the bucket that grows when
+models are evicted/reloaded between gens.
+
+Read-only wrap on upstream functions; never mutates response bytes
+so `/sdapi/v1/*` byte-identity holds. Idempotent install. Capability
+string: `gen-timing`. (`modules/cplugapi/gen_timing.py`)
+
+### Changed — launcher defaults: `--highvram`
+
+Adds `--highvram` to `webui-user.bat`'s `COMMANDLINE_ARGS`. Forge
+defaults to evicting models from VRAM after use; on a 12 GB+ card
+that costs an unnecessary reload between gens (UNet, text encoders,
+VAE). `--highvram` keeps loaded models pinned, which removes the
+between-gens "Requested to load X / Moving model(s) has taken Ns"
+chatter from the log and shaves seconds off the perceived latency
+of consecutive gens. `--gpu-only` is the more aggressive variant
+(documented inline in the .bat) for 16 GB+ deployments that want
+zero offloading. (`webui-user.bat`)
+
 ### Fixed — TOCTOU race in TAESD / VAEApprox live-preview downloads
 
 Two concurrent generations both triggering live-preview decoder

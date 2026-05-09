@@ -77,6 +77,36 @@ Set `CPLUG_ACCESS_LOG=0` (or `false`/`no`/`off`) to disable emission;
 the middleware still installs but skips the format step. Capability
 string: `request-log`.
 
+## Generation timing log
+
+One structured line per call to `modules.processing.process_images_inner`
+(i.e. one per `/sdapi/v1/txt2img` / `img2img` request) is emitted to
+the `cplugapi.gen_timing` Python logger. Format:
+
+```text
+gen total_ms=8412.3 vae_decode_ms=287.6
+```
+
+Fields:
+
+| Field | Meaning |
+|---|---|
+| `total_ms` | Wall-clock from the start of `process_images_inner` to its return (or exception). Includes conditioning prep, sampling, VAE decode, save. |
+| `vae_decode_ms` | Sum of time spent in `decode_latent_batch` for this gen. HR-pass calls accumulate. |
+| `error=<ExceptionName>` | Set when the gen raised; the line still emits so failed gens are visible. |
+
+The hook installs at cplugapi mount time as an in-place wrap on the
+upstream functions; it is read-only — never mutates response bytes —
+so `/sdapi/v1/*` byte-identity holds.
+
+Diagnostic flow: subtract `vae_decode_ms` and Forge's own sampler
+tqdm time from `total_ms` to get pre-sampling cost (conditioning
+encode, init prep, kernel JIT, etc.). That pre-sampling number is
+the one that grows when the model is being evicted/reloaded between
+gens.
+
+Capability string: `gen-timing`.
+
 ## Cross-cutting headers
 
 | Header | Direction | Purpose |
@@ -312,6 +342,7 @@ models/architecture
 models/disk-scan
 models/architectures-available
 request-log
+gen-timing
 ```
 
 ## Environment variables
