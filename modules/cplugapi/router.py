@@ -12,6 +12,7 @@ from typing import Callable, Optional
 from fastapi import APIRouter, Depends, FastAPI
 
 from . import (
+    access_log,
     active_model,
     architectures,
     capabilities,
@@ -50,6 +51,7 @@ def _register_capabilities() -> None:
     idempotency.register_capabilities()
     livez_readyz.register_capabilities()
     queue_endpoint.register_capabilities()
+    access_log.register_capabilities()
     # Model arch detection (/v1/models/*).
     active_model.register_capabilities()
     sd_checkpoints.register_capabilities()
@@ -91,25 +93,29 @@ def _install_middlewares(app: FastAPI) -> None:
     1. idempotency  (added first  → runs last  → wraps the handler)
     2. request_id   (added second → runs middle → stamps state.request_id
                                                  + echoes header on the way out)
-    3. security     (added last   → runs first  → rejects bad requests
+    3. security     (added third  → runs middle → rejects bad requests
                                                  before any work happens)
+    4. access_log   (added last   → runs first  → measures total
+                                                 server-side wall time and
+                                                 emits one line per request)
 
-    All three are no-ops outside ``/cplugapi/v1/*`` so ``/sdapi/v1/*``
+    All four are no-ops outside ``/cplugapi/v1/*`` so ``/sdapi/v1/*``
     byte-identity (CLAUDE.md hard invariant 1) is preserved.
 
     The individual ``install()`` helpers append to ``app.user_middleware``
     rather than calling ``app.add_middleware`` (which Starlette rejects
-    once the app has accepted its first request). After all three are
+    once the app has accepted its first request). After all four are
     registered we rebuild the stack on-the-fly so the new layer is live
     by the time the first ``/cplugapi/v1/*`` request arrives.
     """
     idempotency.install(app)
     request_id.install(app)
     security_middleware.install(app)
+    access_log.install(app)
     # Force a rebuild — Starlette caches the live stack on first request,
     # and ``build_middleware_stack()`` only returns the new stack rather
     # than installing it. Reassign so the next request picks up the new
-    # layers (idempotency / request_id / security).
+    # layers.
     app.middleware_stack = app.build_middleware_stack()
 
 
