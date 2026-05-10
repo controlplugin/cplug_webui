@@ -204,6 +204,12 @@ def install(app: FastAPI, prefixes: tuple[str, ...] = DEFAULT_PREFIXES) -> None:
 
 
 def register_capabilities() -> None:
-    """Advertise the sdapi-side request observer (only when enabled)."""
+    """Advertise the sdapi-side request observer (only when enabled).
+
+    W15 — dual-emits ``observability/sdapi-request-log`` (new) and
+    ``sdapi-request-log`` (legacy)."""
     if _is_enabled():
-        capabilities.register("sdapi-request-log")
+        capabilities.register_with_legacy(
+            new_name="observability/sdapi-request-log",
+            legacy_name="sdapi-request-log",
+        )

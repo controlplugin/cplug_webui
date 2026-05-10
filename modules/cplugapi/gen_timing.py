@@ -229,6 +229,12 @@ def install_hooks() -> None:
 
 
 def register_capabilities() -> None:
-    """Advertise per-gen pipeline timing (only when enabled)."""
+    """Advertise per-gen pipeline timing (only when enabled).
+
+    W15 — dual-emits ``observability/gen-timing`` (new) and
+    ``gen-timing`` (legacy)."""
     if _is_enabled():
-        capabilities.register("gen-timing")
+        capabilities.register_with_legacy(
+            new_name="observability/gen-timing",
+            legacy_name="gen-timing",
+        )

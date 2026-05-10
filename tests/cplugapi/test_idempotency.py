@@ -111,8 +111,12 @@ def test_malformed_key_rejected_with_400(clean_capabilities):
             f"{PREFIX}/_idem_probe", headers={"Idempotency-Key": bad}
         )
         assert r.status_code == 400, bad
+        # W3: error envelope is now RFC 9457 problem+json with stable
+        # ``code`` field. Legacy ``error`` key is gone (one minor of
+        # dual emission would only soften the rename, not preserve a
+        # different name). Asserting ``code`` is the new contract.
         body = r.json()
-        assert body.get("error") == "invalid_idempotency_key"
+        assert body.get("code") == "idempotency_key_invalid"
 
     # None of the malformed calls reached the handler.
     assert calls == []
@@ -264,3 +268,116 @@ def test_register_capabilities_adds_idempotency(clean_capabilities):
 
     idempotency.register_capabilities()
     assert "idempotency" in capabilities.enabled_capabilities()
+
+
+# ---------------------------------------------------------------------------
+# W6 — replay header sanitisation (allow-list)
+# ---------------------------------------------------------------------------
+
+
+def _set_cookie_attach(call_log: list):
+    """Route that sets a Set-Cookie header on the response. Used to
+    verify the cookie is dropped on idempotency replay."""
+    from starlette.responses import JSONResponse
+
+    def attach(r: APIRouter) -> None:
+        @r.post("/_idem_cookie")
+        def post_probe() -> JSONResponse:
+            call_log.append("post")
+            resp = JSONResponse(
+                {"n": len(call_log)},
+                headers={
+                    "Set-Cookie": "session=secret-token; Path=/",
+                    "X-Cplug-Custom": "fork-owned-passthrough",
+                    "Server": "cplug-test/1.0",
+                    "X-Random-Trinket": "should-be-dropped",
+                    "Cache-Control": "no-cache",
+                },
+            )
+            return resp
+
+    return attach
+
+
+def test_replay_drops_set_cookie(clean_capabilities):
+    """A cached response carrying ``Set-Cookie`` must NOT replay it on
+    a subsequent Idempotency-Key match — auth/session token bleed."""
+    calls: list[str] = []
+    client = _make_client_with(_set_cookie_attach(calls))
+    headers = {"Idempotency-Key": "cookie-leak-test-1"}
+
+    first = client.post(f"{PREFIX}/_idem_cookie", headers=headers)
+    assert first.status_code == 200
+    assert "set-cookie" in {k.lower() for k in first.headers.keys()}
+
+    second = client.post(f"{PREFIX}/_idem_cookie", headers=headers)
+    assert second.status_code == 200
+    assert second.headers.get("Idempotency-Replayed") == "true"
+    # The replayed response must NOT carry the cached Set-Cookie.
+    assert "set-cookie" not in {k.lower() for k in second.headers.keys()}
+    # Server / Date are also drop-listed.
+    assert "server" not in {k.lower() for k in second.headers.keys()}
+    # X-Random-Trinket is not in the allow-list -> dropped.
+    assert "x-random-trinket" not in {k.lower() for k in second.headers.keys()}
+
+
+def test_replay_preserves_x_cplug_prefix(clean_capabilities):
+    """The fork-owned ``X-Cplug-*`` namespace is by definition replay-safe."""
+    calls: list[str] = []
+    client = _make_client_with(_set_cookie_attach(calls))
+    headers = {"Idempotency-Key": "cplug-prefix-test-1"}
+
+    client.post(f"{PREFIX}/_idem_cookie", headers=headers)
+    second = client.post(f"{PREFIX}/_idem_cookie", headers=headers)
+    assert second.headers.get("X-Cplug-Custom") == "fork-owned-passthrough"
+    # Cache-Control is on the static allow-list.
+    assert second.headers.get("Cache-Control") == "no-cache"
+
+
+def test_replay_x_request_id_is_fresh_per_request(clean_capabilities):
+    """X-Request-Id on the cached response is dropped; the request_id
+    middleware overwrites with the *current* request's id on egress.
+    Verifies log correlation hygiene survives idempotency replay."""
+    calls: list[str] = []
+    client = _make_client_with(_counting_post_attach(calls))
+    headers = {"Idempotency-Key": "req-id-fresh-test-1"}
+
+    # First call seeds the cache with X-Request-Id=req_first_call.
+    client.post(
+        f"{PREFIX}/_idem_probe",
+        headers={**headers, "X-Request-Id": "req_first_call"},
+    )
+    second = client.post(
+        f"{PREFIX}/_idem_probe",
+        headers={**headers, "X-Request-Id": "req_second_call_replay"},
+    )
+    assert second.headers.get("Idempotency-Replayed") == "true"
+    # Replay must echo the SECOND call's request id, not the first's.
+    assert second.headers.get("X-Request-Id") == "req_second_call_replay"
+
+
+def test_middleware_install_order_request_id_outside_idempotency(clean_capabilities):
+    """Regression test for the canonical install order
+    (plan/cplugapi-world-class.md §3.0): ``request_id`` must sit
+    OUTSIDE ``idempotency`` so on cache replay, request_id overwrites
+    any stale id with the current request's id on egress.
+
+    A future rebase that flips this ordering would silently break
+    log correlation; this test fails loudly when that happens."""
+
+    app = FastAPI()
+    setup_cplugapi(app)
+    middlewares = [m.cls.__name__ for m in app.user_middleware]
+    # The middleware list runs most-recently-added FIRST in Starlette.
+    # router.py appends idempotency first, then request_id, then
+    # security, then access_log — so by index the order is reversed.
+    # Verify request_id is positioned BEFORE (i.e., wraps) idempotency
+    # in run order.
+    idem_pos = middlewares.index("CplugapiIdempotencyMiddleware")
+    rid_pos = middlewares.index("CplugapiRequestIdMiddleware")
+    # In ``user_middleware``, lower index = runs FIRST = outer.
+    # request_id must be at a lower index than idempotency.
+    assert rid_pos < idem_pos, (
+        f"request_id must wrap idempotency (run outside it). "
+        f"Order in user_middleware: {middlewares}"
+    )

@@ -143,7 +143,7 @@ import logging
 import os
 import threading
 import weakref
-from typing import Any, Optional
+from typing import Optional
 
 _log = logging.getLogger(__name__)
 try:

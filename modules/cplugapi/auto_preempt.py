@@ -91,10 +91,21 @@ def _resolve_mode() -> str:
     Falls back to :data:`DEFAULT_MODE` on missing or unrecognised
     values, with a warning so a typo doesn't silently produce
     unexpected behavior.
+
+    W5: when the env var is unset and the deployment profile is
+    ``cloud``, the fallback flips to :data:`MODE_OFF` instead of
+    :data:`DEFAULT_MODE` (``always``). Cloud deployments are not the
+    sketch-workflow target, so cancelling every previous gen on each
+    new submit is the wrong default. Operators who actually want
+    preempt in cloud opt in via ``CPLUG_PREEMPT_MODE=always|header``.
     """
     raw = os.environ.get(ENV_MODE, "").strip().lower()
     if raw == "":
-        return DEFAULT_MODE
+        # Profile-driven default. Imported lazily so test fixtures that
+        # monkeypatch CPLUG_DEPLOYMENT_PROFILE see the latest value.
+        from . import profile
+
+        return MODE_OFF if profile.is_cloud() else DEFAULT_MODE
     if raw in _VALID_MODES:
         return raw
     _log.warning(

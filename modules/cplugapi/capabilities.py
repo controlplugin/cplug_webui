@@ -20,6 +20,13 @@ _log = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 _registry: dict[str, Predicate] = {}
+# W15 — capability strings scheduled for removal in the next minor.
+# Both the legacy string and its replacement are simultaneously
+# registered (dual-emission window); this set tracks the legacy
+# strings so ``/health`` and ``/identify`` can publish a
+# ``deprecated_capabilities[]`` array — the Rust client gets a
+# release cycle to migrate, then the legacy string is dropped.
+_deprecated: set[str] = set()
 
 
 def register(name: str, predicate: Optional[Predicate] = None) -> None:
@@ -38,10 +45,49 @@ def register(name: str, predicate: Optional[Predicate] = None) -> None:
         _registry[name] = predicate or (lambda: True)
 
 
+def register_with_legacy(
+    new_name: str,
+    legacy_name: str,
+    predicate: Optional[Predicate] = None,
+) -> None:
+    """Register both a new namespaced name and a legacy alias (W15).
+
+    Both strings appear on ``/health.capabilities[]`` and
+    ``/identify.capabilities[]``. The legacy name is additionally
+    tracked in :func:`deprecated_capabilities` so clients can detect
+    the upcoming removal.
+
+    Use this for fork-local capability strings that are being
+    re-namespaced (e.g. ``request-log`` → ``observability/request-log``).
+    Canonical capability strings (those listed in the project's
+    capability registry) MUST NOT change names — call :func:`register`
+    for those.
+    """
+    if new_name == legacy_name:
+        raise ValueError(
+            f"register_with_legacy: new_name and legacy_name must differ "
+            f"(both are {new_name!r}). For a single name with no rename, "
+            "call register() directly."
+        )
+    register(new_name, predicate)
+    register(legacy_name, predicate)
+    with _lock:
+        _deprecated.add(legacy_name)
+
+
 def unregister(name: str) -> None:
     """Remove a capability. No-op if absent. Primarily for tests."""
     with _lock:
         _registry.pop(name, None)
+        _deprecated.discard(name)
+
+
+def deprecated_capabilities() -> list[str]:
+    """Return the sorted list of legacy capability strings scheduled
+    for removal. Surfaces on ``/health`` and ``/identify`` so clients
+    can detect the deprecation window."""
+    with _lock:
+        return sorted(_deprecated)
 
 
 def enabled_capabilities() -> list[str]:
@@ -67,3 +113,4 @@ def reset() -> None:
     """Clear the registry. Test-only."""
     with _lock:
         _registry.clear()
+        _deprecated.clear()

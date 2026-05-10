@@ -18,7 +18,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from modules.cplugapi import PREFIX, access_log, setup_cplugapi
+from modules.cplugapi import PREFIX, setup_cplugapi
 
 
 @pytest.fixture

@@ -32,6 +32,7 @@ def _basic_payload() -> dict[str, Any]:
     return {
         "status": status,
         "capabilities": capabilities.enabled_capabilities(),
+        "deprecated_capabilities": capabilities.deprecated_capabilities(),
         "active_task_id": progress.current_task,
         "queue_depth": queue_depth,
     }

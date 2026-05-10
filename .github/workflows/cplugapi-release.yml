@@ -1,0 +1,57 @@
+name: cplugapi release
+
+# W18 — on tag push, attach the cplugapi OpenAPI artifact to the
+# matching GitHub Release. Lives in its own workflow file because
+# GitHub Actions' ``paths:`` filter on the ``push`` event applies to
+# tags as well as branches — a release tag that doesn't touch the
+# filtered paths would otherwise not fire the publish job. A dedicated
+# workflow with no ``paths:`` filter sidesteps that.
+#
+# Also exposes a manual ``workflow_dispatch`` trigger so an operator
+# can re-attach the artifact to a release after the fact (e.g. if the
+# tag-push CI was throttled or the artifact step was patched).
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v0.2.0). Defaults to ref name.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  publish-openapi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip fastapi pytest httpx
+
+      - name: Resolve build-time env vars
+        run: |
+          fork_sha=$(git rev-parse --short HEAD)
+          echo "CPLUG_FORK_COMMIT=$fork_sha" >> "$GITHUB_ENV"
+          build_date=$(git show -s --format=%cI HEAD)
+          echo "CPLUG_FORK_BUILD_DATE=$build_date" >> "$GITHUB_ENV"
+
+      - name: Export OpenAPI spec
+        run: python scripts/export_cplugapi_openapi.py cplugapi-openapi.json
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: cplugapi-openapi.json
+          fail_on_unmatched_files: true

@@ -75,11 +75,12 @@ def test_setup_is_thread_safe_under_concurrent_call(clean_capabilities):
         t.join()
 
     cplug_routes = [r for r in app.routes if hasattr(r, "path") and r.path.startswith(PREFIX)]
-    # 13 endpoints — Phase 1: identify, health, version, session/cancel,
+    # 14 endpoints — Phase 1: identify, health, version, session/cancel,
     # session/preempt, forge/preset, _ping; audit-02 Phase B: livez,
     # readyz, queue; model-arch-detection: models/active,
-    # models/sd-checkpoints, models/architectures.
-    assert len(cplug_routes) == 13
+    # models/sd-checkpoints, models/architectures; world-class W10:
+    # metrics.
+    assert len(cplug_routes) == 14
 
 
 def test_only_identify_is_unauthenticated(clean_capabilities):
@@ -110,9 +111,16 @@ def test_only_identify_is_unauthenticated(clean_capabilities):
         else:
             public_paths.append(route.path)
 
-    assert public_paths == [f"{PREFIX}/identify"], (
-        f"unexpected public routes: {public_paths}"
-    )
+    # /identify is public so clients can fingerprint a backend before
+    # sending credentials. /livez and /readyz are public (W1) so cloud
+    # orchestrators can poll them without injecting Basic-auth headers
+    # — the readyz body is sanitised for unauth callers; verbose
+    # detail is gated on the same auth dep via ?verbose=1.
+    assert sorted(public_paths) == sorted([
+        f"{PREFIX}/identify",
+        f"{PREFIX}/livez",
+        f"{PREFIX}/readyz",
+    ]), f"unexpected public routes: {public_paths}"
     # Sanity — at least the Phase 1 endpoints should be on the private side.
     assert any(p.endswith("/health") for p in private_paths)
     assert any(p.endswith("/version") for p in private_paths)

@@ -36,9 +36,10 @@ from typing import Optional
 from fastapi import FastAPI, Request
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse, Response
+from starlette.responses import Response
 
 from . import capabilities
+from .errors import CODES, cplugapi_problem
 
 HEADER_KEY = "Idempotency-Key"
 HEADER_REPLAYED = "Idempotency-Replayed"
@@ -157,24 +158,94 @@ def _validate_key(key: str) -> bool:
     return _KEY_REGEX.match(key) is not None
 
 
+# W6 — replay header allow-list. Stored as an explicit set of safe
+# header names so the cached response cannot resurrect a stale
+# ``Set-Cookie`` (auth/session token bleed across distinct callers),
+# ``Date`` (clock-skew leak), ``Server`` (build-version recon), or
+# ``X-Request-Id`` (log correlation hazard if a future rebase reorders
+# the middleware stack so request_id sits inside idempotency).
+#
+# Anything not on this list is dropped on replay. Adding a header
+# deliberately requires a code change — the right approach when the
+# default is "drop" — and forces a reviewer to think about whether
+# the new header is replay-safe.
+_REPLAY_ALLOW: frozenset[str] = frozenset({
+    # Content semantics — required for the replayed body to decode
+    # correctly on the client.
+    "content-type",
+    "content-encoding",
+    "content-language",
+    # Cache hints — pure metadata, no leak vector.
+    "cache-control",
+    "etag",
+    "last-modified",
+    "vary",
+    # cplugapi extensions — fork-owned namespace; the X-Cplug-*
+    # prefix is fork policy (see CLAUDE.md), so any header in this
+    # namespace is by definition safe to replay.
+    # Per-prefix matching handled separately below.
+})
+
+# Headers stored on cache entries we explicitly drop even though they
+# *might* look harmless — defence-in-depth catalog.
+_REPLAY_DROP: frozenset[str] = frozenset({
+    # Auth / session / state — never replay across requests.
+    "set-cookie",
+    "set-cookie2",
+    "authorization",
+    "www-authenticate",
+    "proxy-authenticate",
+    # Per-request metadata that becomes stale instantly.
+    "date",
+    "server",
+    "x-request-id",  # request_id middleware overwrites this anyway,
+                     # but stripping in cache means a future rebase
+                     # that reorders middlewares can't regress.
+    # Transport framing — Response.__init__ rewrites these.
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    # Our own marker — set fresh on every replay.
+    HEADER_REPLAYED.lower(),
+})
+
+
+def _is_replay_safe_header(name: str) -> bool:
+    """A header is replay-safe if it's in the allow-list OR carries the
+    fork-owned ``X-Cplug-*`` prefix."""
+    n = name.lower()
+    if n in _REPLAY_ALLOW:
+        return True
+    if n.startswith("x-cplug-"):
+        return True
+    return False
+
+
 def _replay(entry: _CacheEntry) -> Response:
-    """Reconstruct a Response from a cache entry and tag it as replayed."""
+    """Reconstruct a Response from a cache entry and tag it as replayed.
+
+    The cached response's headers are filtered through an explicit
+    allow-list (W6) — anything outside the allow-list is dropped on
+    replay so stale ``Set-Cookie`` / ``Date`` / ``Server`` / etc.
+    cannot leak across requests. The ``X-Request-Id`` header is
+    dropped here as defence-in-depth; the request_id middleware
+    overwrites it on egress regardless, but stripping it from the
+    cache entry means a future rebase that reorders middlewares
+    cannot silently regress correlation hygiene.
+    """
     response = Response(
         content=entry.body,
         status_code=entry.status,
         media_type=entry.media_type,
     )
-    # Restore the original headers (preserving duplicates / order). We
-    # explicitly skip Content-Length — Response.__init__ already wrote
-    # one based on ``entry.body`` — and any pre-existing
-    # Idempotency-Replayed header so we can set our own canonical value.
-    # ``raw_headers`` is a list of (bytes, bytes) tuples; entries are
-    # stored as (str, str) for cache-survivability so we re-encode here.
-    skip = {"content-length", HEADER_REPLAYED.lower()}
+    # Allow-list filter — `_is_replay_safe_header` covers both the
+    # static allow set and the fork-owned X-Cplug-* prefix.
+    # ``raw_headers`` is a list of (bytes, bytes); entries store
+    # (str, str) for cache-survivability so we re-encode here.
     response.raw_headers = [
         (name.encode("latin-1"), value.encode("latin-1"))
         for (name, value) in entry.headers
-        if name.lower() not in skip
+        if _is_replay_safe_header(name)
     ]
     response.headers[HEADER_REPLAYED] = "true"
     return response
@@ -205,15 +276,15 @@ class CplugapiIdempotencyMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         if not _validate_key(key):
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": "invalid_idempotency_key",
-                    "detail": (
-                        f"Idempotency-Key must be {_KEY_MIN_LEN}-{_KEY_MAX_LEN} "
-                        "ASCII chars from [A-Za-z0-9_:.-]"
-                    ),
-                },
+            rid = getattr(request.state, "request_id", None)
+            return cplugapi_problem(
+                status=400,
+                code=CODES.IDEMPOTENCY_KEY_INVALID,
+                detail=(
+                    f"Idempotency-Key must be {_KEY_MIN_LEN}-{_KEY_MAX_LEN} "
+                    "ASCII chars from [A-Za-z0-9_:.-]"
+                ),
+                request_id=rid,
             )
 
         cache_key = (request.method.upper(), request.url.path, key)

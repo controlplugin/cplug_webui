@@ -162,7 +162,9 @@ class CplugapiAccessLogMiddleware(BaseHTTPMiddleware):
             self._emit(method, path, status, in_bytes, out_bytes, replayed,
                        (time.perf_counter() - start) * 1000.0,
                        request_id=getattr(request.state, "request_id", None),
-                       error_name=error_name)
+                       error_name=error_name,
+                       traceparent=getattr(request.state, "traceparent", None),
+                       trace_id=getattr(request.state, "trace_id", None))
             raise
 
         status = response.status_code
@@ -174,10 +176,20 @@ class CplugapiAccessLogMiddleware(BaseHTTPMiddleware):
         # default install order), state is already stamped by the time
         # call_next returns.
         request_id = getattr(request.state, "request_id", None)
+        # W11 — pull traceparent / trace_id off state so JSON-mode log
+        # scrapers can correlate cplugapi access lines to distributed
+        # traces. Both fields are populated by the W11 tracing
+        # middleware (sibling to request_id, runs OUTSIDE access_log
+        # in the canonical stack but INSIDE access_log's call_next at
+        # the time we read state).
+        traceparent = getattr(request.state, "traceparent", None)
+        trace_id = getattr(request.state, "trace_id", None)
 
         self._emit(method, path, status, in_bytes, out_bytes, replayed,
                    (time.perf_counter() - start) * 1000.0,
-                   request_id=request_id)
+                   request_id=request_id,
+                   traceparent=traceparent,
+                   trace_id=trace_id)
         return response
 
     @staticmethod
@@ -191,6 +203,8 @@ class CplugapiAccessLogMiddleware(BaseHTTPMiddleware):
         dur_ms: float,
         request_id: Optional[str],
         error_name: Optional[str] = None,
+        traceparent: Optional[str] = None,
+        trace_id: Optional[str] = None,
     ) -> None:
         """Format + emit the access line.
 
@@ -200,8 +214,8 @@ class CplugapiAccessLogMiddleware(BaseHTTPMiddleware):
         do not change.
         """
         # ``extra`` is also populated so callers using a structured
-        # JSON formatter (e.g. python-json-logger) get the same fields
-        # without parsing the rendered message.
+        # JSON formatter (W9) get the same fields without parsing the
+        # rendered message.
         extra = {
             "request_id": request_id,
             "method": method,
@@ -214,6 +228,10 @@ class CplugapiAccessLogMiddleware(BaseHTTPMiddleware):
         }
         if error_name is not None:
             extra["error"] = error_name
+        if traceparent is not None:
+            extra["traceparent"] = traceparent
+        if trace_id is not None:
+            extra["trace_id"] = trace_id
 
         rendered = (
             f"{method} {path} status={status} "
@@ -225,6 +243,8 @@ class CplugapiAccessLogMiddleware(BaseHTTPMiddleware):
             rendered += " replayed=1"
         if error_name is not None:
             rendered += f" error={error_name}"
+        if trace_id is not None:
+            rendered += f" trace_id={trace_id}"
 
         _log.info(rendered, extra=extra)
 
@@ -251,5 +271,13 @@ def install(app: FastAPI) -> None:
 
 
 def register_capabilities() -> None:
-    """Advertise that this build emits per-request access logs."""
-    capabilities.register("request-log")
+    """Advertise that this build emits per-request access logs.
+
+    W15 — dual-emits ``observability/request-log`` (new) and
+    ``request-log`` (legacy). The legacy string is marked deprecated;
+    it'll be dropped in the next minor after the Rust client confirms
+    migration."""
+    capabilities.register_with_legacy(
+        new_name="observability/request-log",
+        legacy_name="request-log",
+    )

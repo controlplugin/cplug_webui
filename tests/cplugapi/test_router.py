@@ -38,6 +38,10 @@ def test_identify_returns_constants(clean_capabilities):
     # commits default to "unknown" without CI env vars.
     assert "fork_commit" in body
     assert "upstream_commit" in body
+    # W4: capability set surfaces here too so clients can negotiate
+    # features without authenticating to /health first.
+    assert isinstance(body["capabilities"], list)
+    assert "identify" in body["capabilities"]
 
 
 def test_identify_is_unauthenticated_even_when_auth_set(clean_capabilities):

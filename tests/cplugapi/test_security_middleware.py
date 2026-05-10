@@ -13,7 +13,10 @@ from fastapi.testclient import TestClient
 from modules.cplugapi import security_middleware
 from modules.cplugapi.security_middleware import (
     PROTECTED_PREFIX,
+    ROUTE_LIMITS,
     CplugapiSecurityMiddleware,
+    _match_route_limit,
+    _parse_route_limits_env,
     install,
     register_capabilities,
 )
@@ -274,6 +277,257 @@ def test_post_invalid_content_length_rejected():
     assert resp.status_code == 400
 
 
+# --- Per-route body-size caps (W7) -------------------------------------------
+
+
+def _direct_dispatch(
+    mw: CplugapiSecurityMiddleware, method: str, path: str, content_length: str
+):
+    """Run a synthetic request through the middleware bypassing
+    TestClient. TestClient rewrites Content-Length to match the
+    actual body it transmits, which defeats the cap test; ASGI
+    scope-level injection is the only reliable path."""
+    import asyncio
+
+    from starlette.requests import Request
+
+    async def fake_call_next(request):
+        from starlette.responses import JSONResponse
+        return JSONResponse({"ok": True})
+
+    scope = {
+        "type": "http",
+        "method": method,
+        "path": path,
+        "headers": [
+            (b"host", b"127.0.0.1:7860"),
+            (b"content-length", content_length.encode()),
+        ],
+        "query_string": b"",
+    }
+    request = Request(scope)
+    return asyncio.new_event_loop().run_until_complete(
+        mw.dispatch(request, fake_call_next)
+    )
+
+
+def test_match_route_limit_exact_prefix_with_trailing_slash():
+    """A path that extends a ``/``-terminated prefix matches."""
+    cap = _match_route_limit(
+        "POST",
+        "/cplugapi/v1/forge/preset/sketch",
+        ROUTE_LIMITS,
+    )
+    assert cap == 4 * 1024
+
+
+def test_match_route_limit_eos_match():
+    """A path that exactly equals a non-``/``-terminated rule prefix
+    matches via the EOS branch — that is how ``/session/preempt``
+    (no trailing slash in the rule) catches the bare path."""
+    cap = _match_route_limit(
+        "POST",
+        "/cplugapi/v1/session/preempt",
+        ROUTE_LIMITS,
+    )
+    assert cap == 4 * 1024
+
+
+def test_match_route_limit_adjacent_path_does_not_match():
+    """``/cplugapi/v1/forge/preset-bulk`` shares the substring
+    ``/cplugapi/v1/forge/preset`` with the rule but the boundary
+    character is ``-`` not ``/`` or EOS. Must NOT match."""
+    cap = _match_route_limit(
+        "POST",
+        "/cplugapi/v1/forge/preset-bulk",
+        ROUTE_LIMITS,
+    )
+    assert cap is None
+
+
+def test_match_route_limit_method_must_match():
+    """A GET to an otherwise-matching path falls through; the rule
+    table is keyed on ``(method, path)``."""
+    cap = _match_route_limit(
+        "GET",
+        "/cplugapi/v1/forge/preset/sketch",
+        ROUTE_LIMITS,
+    )
+    assert cap is None
+
+
+def test_match_route_limit_longest_prefix_wins():
+    """When two rules both match, the longer prefix takes precedence."""
+    table = {
+        ("POST", "/a/"): 100,
+        ("POST", "/a/b/"): 50,
+    }
+    cap = _match_route_limit("POST", "/a/b/c", table)
+    assert cap == 50
+
+
+def test_post_oversized_route_specific_cap_rejects_64k_body():
+    """W7 acceptance test 1: 64 KiB POST to a per-route-capped endpoint
+    returns 413 with the W3 problem+json envelope and code
+    ``body_too_large``."""
+    app = _make_app()
+    mw = CplugapiSecurityMiddleware(app)
+    resp = _direct_dispatch(
+        mw,
+        "POST",
+        "/cplugapi/v1/forge/preset/sketch",
+        str(64 * 1024),
+    )
+    assert resp.status_code == 413
+    assert resp.media_type == "application/problem+json"
+    import json
+    body = json.loads(resp.body)
+    assert body["code"] == "body_too_large"
+    assert body["status"] == 413
+    # Detail string distinguishes per-route from global cap rejection.
+    assert "route-specific" in body["detail"]
+
+
+def test_post_under_route_specific_cap_passes_size_check():
+    """W7 acceptance test 2: 1 KiB POST to a per-route-capped endpoint
+    passes the size check. The downstream may 404 or whatever (no
+    matching FastAPI route registered) — what matters is that the
+    middleware returns ``None`` from ``_check_body_size``, i.e. the
+    body cap does not fire."""
+    app = _make_app()
+    mw = CplugapiSecurityMiddleware(app)
+    resp = _direct_dispatch(
+        mw,
+        "POST",
+        "/cplugapi/v1/forge/preset/sketch",
+        str(1024),
+    )
+    # The fake call_next we plug in always returns 200 — if the
+    # middleware short-circuited with 413, that's the failure.
+    assert resp.status_code == 200
+
+
+def test_adjacent_path_not_subject_to_route_specific_cap():
+    """W7 acceptance test 3: ``/cplugapi/v1/forge/preset-bulk`` (a
+    hypothetical sibling that does NOT match the route prefix per the
+    boundary rule) gets the global cap, not the 4 KiB route cap. A
+    5 KiB body should pass — well over the route cap, well under
+    the 32 MiB global cap."""
+    app = _make_app()
+    mw = CplugapiSecurityMiddleware(app)
+    resp = _direct_dispatch(
+        mw,
+        "POST",
+        "/cplugapi/v1/forge/preset-bulk",
+        str(5 * 1024),
+    )
+    assert resp.status_code == 200
+
+
+def test_route_limits_env_override(monkeypatch):
+    """W7 acceptance test 4: ``CPLUG_ROUTE_BODY_LIMITS`` overrides the
+    built-in table. A 1024-byte body to the override route is fine;
+    a 1025-byte body trips the cap."""
+    monkeypatch.setenv(
+        security_middleware.ENV_ROUTE_BODY_LIMITS,
+        "POST:/cplugapi/v1/_test/strict:512",
+    )
+    app = _make_app()
+    mw = CplugapiSecurityMiddleware(app)
+
+    resp = _direct_dispatch(
+        mw,
+        "POST",
+        "/cplugapi/v1/_test/strict",
+        str(1024),
+    )
+    assert resp.status_code == 413
+    import json
+    body = json.loads(resp.body)
+    assert body["code"] == "body_too_large"
+    assert "route-specific" in body["detail"]
+
+    # Same middleware instance (env captured at __init__), under-cap body passes.
+    resp_ok = _direct_dispatch(
+        mw,
+        "POST",
+        "/cplugapi/v1/_test/strict",
+        str(256),
+    )
+    assert resp_ok.status_code == 200
+
+
+def test_route_limits_env_replaces_defaults(monkeypatch):
+    """When env overrides are set, the built-in ROUTE_LIMITS defaults
+    are NOT silently merged. Operators get exactly the table they
+    specified — same posture as ``CPLUG_ALLOWED_HOSTS``. Confirms by
+    checking that a previously-capped route falls back to the global
+    cap when the override doesn't list it."""
+    monkeypatch.setenv(
+        security_middleware.ENV_ROUTE_BODY_LIMITS,
+        "POST:/cplugapi/v1/_test/strict:512",
+    )
+    app = _make_app()
+    mw = CplugapiSecurityMiddleware(app)
+
+    # /forge/preset/sketch was 4 KiB by default; now it should fall
+    # back to the 32 MiB global cap. A 64 KiB body passes.
+    resp = _direct_dispatch(
+        mw,
+        "POST",
+        "/cplugapi/v1/forge/preset/sketch",
+        str(64 * 1024),
+    )
+    assert resp.status_code == 200
+
+
+def test_route_limits_env_malformed_entries_skipped(monkeypatch):
+    """Malformed entries are logged and skipped; valid entries on the
+    same line still apply."""
+    monkeypatch.setenv(
+        security_middleware.ENV_ROUTE_BODY_LIMITS,
+        "garbage,POST:/cplugapi/v1/_test/strict:512,POST:/x:notanint",
+    )
+    parsed = _parse_route_limits_env(security_middleware.ENV_ROUTE_BODY_LIMITS)
+    assert parsed == {("POST", "/cplugapi/v1/_test/strict"): 512}
+
+
+def test_route_limit_problem_envelope_carries_request_id():
+    """The 413 response carries through ``X-Request-Id`` so ops can
+    correlate the rejection with the rest of the trace — same envelope
+    contract as the global cap path."""
+    import asyncio
+    import json
+
+    from starlette.requests import Request
+
+    app = _make_app()
+    mw = CplugapiSecurityMiddleware(app)
+
+    async def fake_call_next(request):
+        from starlette.responses import JSONResponse
+        return JSONResponse({"ok": True})
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/cplugapi/v1/forge/preset/sketch",
+        "headers": [
+            (b"host", b"127.0.0.1:7860"),
+            (b"content-length", str(64 * 1024).encode()),
+            (b"x-request-id", b"abc-123"),
+        ],
+        "query_string": b"",
+    }
+    request = Request(scope)
+    resp = asyncio.new_event_loop().run_until_complete(
+        mw.dispatch(request, fake_call_next)
+    )
+    assert resp.status_code == 413
+    body = json.loads(resp.body)
+    assert body.get("request_id") == "abc-123"
+
+
 # --- Path scoping ------------------------------------------------------------
 
 
@@ -438,6 +692,7 @@ def test_register_capabilities_emits_slash_only_strings(clean_capabilities):
     assert "security/origin-checks" in enabled
     assert "security/host-checks" in enabled
     assert "security/body-size-cap" in enabled
+    assert "security/per-route-body-limits" in enabled
     # No dot-notation slipped in.
     for name in enabled:
         assert "." not in name

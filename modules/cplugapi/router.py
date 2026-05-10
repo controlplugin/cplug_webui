@@ -16,15 +16,20 @@ from . import (
     active_model,
     architectures,
     asyncio_filter,
+    auto_preempt,
     capabilities,
+    errors,
     gen_timing,
     health,
     identify,
     idempotency,
-    auto_preempt,
     livez_readyz,
+    log_format,
+    metrics,
     preset,
+    profile,
     queue_endpoint,
+    rate_limit,
     request_id,
     runtime,
     sd_checkpoints,
@@ -32,7 +37,11 @@ from . import (
     security_middleware,
     session_cancel,
     session_preempt,
+    shutdown,
+    tracing,
+    upscale_log,
     version_endpoint,
+    ws_auth,
 )
 
 PREFIX = "/cplugapi/v1"
@@ -60,11 +69,21 @@ def _register_capabilities() -> None:
     access_log.register_capabilities()
     gen_timing.register_capabilities()
     sdapi_observer.register_capabilities()
+    upscale_log.register_capabilities()
     auto_preempt.register_capabilities()
     # Model arch detection (/v1/models/*).
     active_model.register_capabilities()
     sd_checkpoints.register_capabilities()
     architectures.register_capabilities()
+    # World-class hardening (W3+).
+    errors.register_capabilities()
+    profile.register_capabilities()
+    ws_auth.register_capabilities()
+    rate_limit.register_capabilities()
+    log_format.register_capabilities()
+    metrics.register_capabilities()
+    tracing.register_capabilities()
+    shutdown.register_capabilities()
 
 
 def setup_cplugapi(
@@ -87,7 +106,29 @@ def setup_cplugapi(
         if getattr(app.state, _MOUNT_FLAG, False):
             return
 
+        # W8 — fail-fast on cloud-profile misconfig before any handler runs.
+        # Cloud + any rate-limit class enabled + no CPLUG_TRUSTED_PROXIES
+        # raises RuntimeError so the operator sees the error at deploy
+        # time rather than after the first 429-bypass.
+        rate_limit.validate_startup()
+
+        # W8 — wrap the auth dep so 401 attempts charge the auth_failed
+        # bucket. Pre-charges before delegating; brute force exhausts the
+        # bucket and gets 429 instead of being able to slam the credential
+        # comparison indefinitely.
+        if auth_dependency is not None:
+            auth_dependency = rate_limit.observe_auth_failures(auth_dependency)
+
         runtime.apply_runtime_tweaks()
+        # W3 — install RFC 9457 problem+json exception handlers (scoped
+        # to /cplugapi/v1/* paths; defers to FastAPI defaults outside).
+        errors.install_handlers(app)
+        # W9 — swap log formatters to JSON when CPLUG_LOG_FORMAT=json.
+        # No-op in text mode (default).
+        log_format.install()
+        # W10 — attach the metrics observer to the cplugapi.access logger
+        # so per-request observations feed the Prometheus registry.
+        metrics.install_handler()
         gen_timing.install_hooks()
         # Late-abort hook for queued-but-preempted gens. Must run AFTER
         # gen_timing.install_hooks so it sits on the OUTSIDE of the
@@ -104,38 +145,47 @@ def setup_cplugapi(
         # ordering (Forge mounts our router AFTER uvicorn's loop is
         # already serving, so a per-loop hook would never fire).
         asyncio_filter.install()
-        _install_middlewares(app)
+        _install_middlewares(app, auth_dependency)
         _do_mount(app, auth_dependency)
         setattr(app.state, _MOUNT_FLAG, True)
 
 
-def _install_middlewares(app: FastAPI) -> None:
+def _install_middlewares(app: FastAPI, auth_dependency: Optional[Callable] = None) -> None:
     """Install the path-scoped middlewares for ``/cplugapi/v1/*``.
 
     Order matters: Starlette runs the most-recently-added middleware
-    first, so we install in *reverse* of the desired runtime order:
+    first, so we install in *reverse* of the desired runtime order.
 
-    1. idempotency  (added first  → runs last  → wraps the handler)
-    2. request_id   (added second → runs middle → stamps state.request_id
-                                                 + echoes header on the way out)
-    3. security     (added third  → runs middle → rejects bad requests
-                                                 before any work happens)
-    4. access_log   (added last   → runs first  → measures total
-                                                 server-side wall time and
-                                                 emits one line per request)
+    Canonical run order (per ``plan/cplugapi-world-class.md`` §3.0):
 
-    All four are no-ops outside ``/cplugapi/v1/*`` so ``/sdapi/v1/*``
-    byte-identity (CLAUDE.md hard invariant 1) is preserved.
+    1. ``access_log``    — outermost; spans full chain for dur_ms
+    2. ``rate_limit``    — reject before expensive work
+    3. ``security``      — origin/host/body checks; problem+json envelope
+    4. ``tracing``       — parses + echoes W3C ``traceparent``
+    5. ``request_id``    — stamps ``request.state.request_id``
+    6. ``shutdown``      — reject-during-drain (when active)
+    7. ``idempotency``   — innermost; replays cached responses
+    8. (handler)
+
+    All eight are no-ops outside ``/cplugapi/v1/*`` so ``/sdapi/v1/*``
+    byte-identity (CLAUDE.md hard invariant 1) is preserved. Five of
+    them additionally short-circuit on non-HTTP scopes (WebSocket).
 
     The individual ``install()`` helpers append to ``app.user_middleware``
     rather than calling ``app.add_middleware`` (which Starlette rejects
-    once the app has accepted its first request). After all four are
+    once the app has accepted its first request). After all are
     registered we rebuild the stack on-the-fly so the new layer is live
     by the time the first ``/cplugapi/v1/*`` request arrives.
     """
+    # Install in REVERSE of run order — insert(0) means lower index
+    # runs earlier, and insert(0) on a later install pushes the
+    # earlier ones to higher indices (i.e. later in run order).
     idempotency.install(app)
+    shutdown.install(app)
     request_id.install(app)
+    tracing.install(app)
     security_middleware.install(app)
+    rate_limit.install(app)
     access_log.install(app)
     # Auto-preempt: cancels the running gen + drains queue when an
     # incoming /sdapi/v1/{txt2img,img2img} arrives. Mode-driven via
@@ -150,6 +200,17 @@ def _install_middlewares(app: FastAPI) -> None:
     # chain (Starlette runs most-recently-added first), giving its
     # dur_ms full coverage of every other layer plus the handler.
     sdapi_observer.install(app)
+    # Upscale-request log: tagged line per /sdapi/v1/extra-single-image
+    # call (always) and per /sdapi/v1/img2img call carrying
+    # ``X-Cplug-Intent: upscale``. Pure ASGI, no body reads — just sniffs
+    # path + headers. Default ON (upscale events are infrequent enough
+    # that the line doesn't flood the console).
+    upscale_log.install(app)
+    # W2 — WebSocket auth shim. Pure-ASGI; no-op for HTTP traffic.
+    # Installed last so it sits at the front of user_middleware and
+    # runs outermost — it must see the raw upgrade scope before any
+    # other layer touches it.
+    ws_auth.install(app, auth_dependency=auth_dependency)
     # Force a rebuild — Starlette caches the live stack on first request,
     # and ``build_middleware_stack()`` only returns the new stack rather
     # than installing it. Reassign so the next request picks up the new
@@ -165,6 +226,19 @@ def _do_mount(app: FastAPI, auth_dependency: Optional[Callable]) -> None:
 
     # Public — unauthenticated probes.
     identify.attach(public)
+    # K8s-style probes belong on the public router so cloud orchestrators
+    # can poll them without injecting Basic-auth headers (W1). The
+    # ``/readyz`` body is sanitised for unauthenticated probes — booleans
+    # only, no error detail. Verbose diagnostic detail is gated on the
+    # same auth dep via ``?verbose=1`` — re-invoked manually inside the
+    # handler.
+    livez_readyz.attach(public, auth_dependency=auth_dependency)
+    # W10 — Prometheus metrics. Default auth-gated; ``CPLUG_METRICS_PUBLIC=1``
+    # moves the endpoint to public for sidecar-style scraping setups.
+    if metrics.is_public():
+        metrics.attach(public)
+    else:
+        metrics.attach(private)
 
     # Private — inherit /sdapi/v1/* auth posture.
     health.attach(private)
@@ -172,7 +246,6 @@ def _do_mount(app: FastAPI, auth_dependency: Optional[Callable]) -> None:
     session_cancel.attach(private)
     session_preempt.attach(private)
     preset.attach(private)
-    livez_readyz.attach(private)
     queue_endpoint.attach(private)
     active_model.attach(private)
     sd_checkpoints.attach(private)
