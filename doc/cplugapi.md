@@ -20,6 +20,36 @@ http://127.0.0.1:7860/cplugapi/v1/identify    -> always reachable
 http://127.0.0.1:7860/cplugapi/v1/health      -> auth-gated when --api-auth set
 ```
 
+## Deployment profile
+
+`CPLUG_DEPLOYMENT_PROFILE` chooses between two coordinated default
+postures (W5):
+
+| Knob | `desktop` (default) | `cloud` |
+|---|---|---|
+| `CPLUG_ALLOWED_HOSTS` default | `127.0.0.1, localhost, [::1]` | `*` (any non-empty Host) |
+| `CPLUG_ALLOWED_ORIGINS` default | loopback regex | `*` (any non-empty Origin) |
+| `CPLUG_PREEMPT_MODE` default | `always` | `off` |
+| Rate-limit defaults (W8) | off | on |
+
+`desktop` matches the fork's primary deployment (single user behind
+`--api-auth` on `127.0.0.1`). `cloud` matches single-replica behind
+an ingress (TLS termination + auth at the proxy, fork bound to
+`0.0.0.0`). Multi-replica deployments are NOT supported; cloud
+profile assumes single-replica behind ingress (cross-replica session
+state, distributed rate-limit state, sticky-session routing are out
+of scope).
+
+Explicit env vars always win over profile defaults. The wildcard `*`
+in `CPLUG_ALLOWED_HOSTS` / `CPLUG_ALLOWED_ORIGINS` is a sentinel
+that accepts any non-empty value; operators can also set the
+wildcard directly without picking a profile.
+
+`Sec-Fetch-Site: cross-site` rejection is NOT profile-gated — cloud
+profile relies on it as the actual cross-origin gate.
+
+Capability: `deployment-profile-cloud` (only when cloud is active).
+
 ## Authentication
 
 `/cplugapi/v1/*` inherits the same Basic-auth dependency as `/sdapi/v1/*`.
@@ -31,6 +61,16 @@ under this prefix honour the same auth.
 
 There is no second auth layer — no API keys, no JWT. Loopback bind +
 `--api-auth` + the security middleware (below) is the security posture.
+
+WebSocket auth is enforced by a pure-ASGI shim
+(`modules/cplugapi/ws_auth.py`, W2) that sits outermost in the
+middleware stack. Any WS upgrade under `/cplugapi/v1/*` without a
+valid `Authorization: Basic` header (when `--api-auth` is set) is
+rejected with HTTP 403 and the standard problem+json envelope before
+the upgrade completes. There are no production WS endpoints today —
+the shim is forward-checked so that when `T31` (`/session/stream/{id_task}`)
+lands, the invariant is already enforced regardless of T31's own
+wiring. Capability: `security/ws-auth-enforced`.
 
 ## Security middleware
 
@@ -59,9 +99,10 @@ once you understand what the client is doing.
 
 | Env var | Stream | Logger | Capability |
 |---|---|---|---|
-| `CPLUG_ACCESS_LOG=1` | `/cplugapi/v1/*` request log | `cplugapi.access` | `request-log` |
-| `CPLUG_SDAPI_OBSERVER=1` | `/sdapi/v1/*` request log | `cplugapi.sdapi` | `sdapi-request-log` |
-| `CPLUG_GEN_TIMING=1` | per-gen pipeline timing | `cplugapi.gen_timing` | `gen-timing` |
+| `CPLUG_ACCESS_LOG=1` | `/cplugapi/v1/*` request log | `cplugapi.access` | `observability/request-log` (legacy: `request-log`) |
+| `CPLUG_SDAPI_OBSERVER=1` | `/sdapi/v1/*` request log | `cplugapi.sdapi` | `observability/sdapi-request-log` (legacy: `sdapi-request-log`) |
+| `CPLUG_GEN_TIMING=1` | per-gen pipeline timing | `cplugapi.gen_timing` | `observability/gen-timing` (legacy: `gen-timing`) |
+| `CPLUG_UPSCALE_LOG=1` (default ON) | tagged log line per upscale request | `cplugapi.upscale` | `observability/upscale-log` (legacy: `upscale-log`) |
 
 All three follow the same pattern: each value is read **once at install
 time**, so toggling requires a webui restart. Setting `0` / `false` /
@@ -89,6 +130,8 @@ formatters):
 | `dur_ms` | Wall-clock spent server-side (everything inside our middleware chain — security + auth + handler). What the client measures minus this is network or client-side. |
 | `in` / `out` | Request and response `Content-Length`, or `-1` if not declared |
 | `req_id` | Same value as the `X-Request-Id` header — joins to client logs |
+| `traceparent` | W3C Trace Context value from the request (echoed unchanged), present only when the client sent one |
+| `trace_id` | 32-hex `trace-id` segment of `traceparent`, parsed out for convenience; absent when no `traceparent` arrived |
 | `replayed=1` | Idempotency cache replay, not a real handler execution |
 | `error=<ExceptionName>` | Handler raised before producing a response |
 
@@ -97,7 +140,7 @@ spans every other cplugapi middleware plus the handler. Outside the
 prefix it is a straight pass-through (zero log lines, zero overhead).
 
 Toggle: `CPLUG_ACCESS_LOG=1` to enable (fork default in
-`webui-user.bat` is `0`). Capability string: `request-log`.
+`webui-user.bat` is `0`). Capability: `observability/request-log` (legacy alias `request-log` also emitted during the W15 deprecation window).
 
 ## Auto-preempt on `/sdapi/v1/{txt2img,img2img}`
 
@@ -168,7 +211,42 @@ fires gens you can't account for. Tails to console alongside
 `cplugapi.access` (cplugapi-specific lines) and
 `cplugapi.gen_timing` (one summary line per `process_images_inner`).
 Toggle: `CPLUG_SDAPI_OBSERVER=1` to enable (fork default `0`).
-Capability: `sdapi-request-log`.
+Capability: `observability/sdapi-request-log` (legacy alias `sdapi-request-log` also emitted during the W15 deprecation window).
+
+### Upscale request log (`/sdapi/v1/extra-single-image` + tagged img2img)
+
+One INFO line per upscale request to the `cplugapi.upscale` Python
+logger. Format:
+
+```text
+upscale request: type=extras POST /sdapi/v1/extra-single-image in=128456
+upscale request: type=img2img-refine POST /sdapi/v1/img2img in=2048576
+```
+
+Fields:
+
+| Field | Meaning |
+|---|---|
+| `type` | `extras` (POST `/sdapi/v1/extra-single-image`) or `img2img-refine` (POST `/sdapi/v1/img2img` with `X-Cplug-Intent: upscale`) |
+| `method` / `path` | HTTP verb + route |
+| `in` | Request `Content-Length`, or `-1` if not declared |
+
+**Why two types**: `/sdapi/v1/extra-single-image` is a distinct
+endpoint, so detection is automatic. The Img2Img-refine flow shares
+`/sdapi/v1/img2img` with ordinary sketch-driven gens — the desktop
+client tags it with the `X-Cplug-Intent` header to distinguish.
+Accepted header values: `upscale`, `upscale-img2img`, `upscale-refine`
+(case-insensitive). Without the header, an img2img request is treated
+as a regular gen and not logged here (avoids tagging every sketch
+stroke as an "upscale").
+
+Pure-ASGI middleware, no body reads — sniffs scope (path + headers)
+and forwards. Read-only on the upstream surface; preserves the
+`/sdapi/v1/*` byte-identity invariant.
+
+Toggle: `CPLUG_UPSCALE_LOG=0` to disable. Default is ON because
+upscale events are infrequent — the log doesn't flood. Capability:
+`observability/upscale-log` (legacy alias `upscale-log` also emitted during the W15 deprecation window).
 
 ### Generation timing log
 
@@ -202,7 +280,66 @@ gens.
 Toggle: `CPLUG_GEN_TIMING=1` to enable (fork default `0`). The
 hooks themselves stay installed when emission is off, so a future
 on-toggle (after restart) doesn't require re-importing the module.
-Capability string: `gen-timing`.
+Capability: `observability/gen-timing` (legacy alias `gen-timing` also emitted during the W15 deprecation window).
+
+## Error envelope (RFC 9457 Problem Details)
+
+Every `/cplugapi/v1/*` error response uses the
+`application/problem+json` media type and the RFC 9457 Problem Details
+shape (RFC 9457 obsoletes RFC 7807 with full wire compatibility):
+
+```json
+{
+  "type": "about:blank",
+  "title": "Forbidden",
+  "status": 403,
+  "detail": "origin not allowed: http://evil.example",
+  "code": "origin_not_allowed",
+  "request_id": "req_abc"
+}
+```
+
+Standard fields: `type`, `title`, `status`, `detail`, `instance` (per
+RFC 9457 §3). cplugapi additions:
+
+- `code` — stable, machine-switchable error identifier (snake_case).
+  Clients SHOULD switch on this. Codes are appended over time, never
+  renamed; the catalog below is authoritative.
+- `request_id` — same value as the `X-Request-Id` response header.
+  Joins client logs to server logs.
+- `errors` (validation only) — RFC 9457 multiple-problems extension.
+  Pydantic field errors surface as a list of sub-problems.
+
+Capability: `error-format-problem-details`.
+
+Outside `/cplugapi/v1/*` (e.g. `/sdapi/v1/*`), exception responses
+keep FastAPI's default `{"detail": "..."}` body — invariant 1
+(byte-identity with upstream Forge Neo) preserved.
+
+### Error code catalog
+
+| Code | Status | Meaning |
+|---|---:|---|
+| `idempotency_key_invalid` | 400 | `Idempotency-Key` header out of charset / length range |
+| `idempotency_key_too_long` | 400 | Reserved; not currently emitted (length-failure path emits `idempotency_key_invalid`) |
+| `invalid_content_length` | 400 | `Content-Length` header is non-numeric |
+| `auth_required` | 401 | Authorization missing / malformed |
+| `auth_failed` | 403 | Authorization present but credentials invalid |
+| `origin_not_allowed` | 403 | `Origin` header not in allow-list |
+| `host_not_allowed` | 403 | `Host` header not in allow-list (rebind defence) |
+| `sec_fetch_site_not_allowed` | 403 | `Sec-Fetch-Site: cross-site` / `same-site` rejected |
+| `task_not_found` | 404 | `/session/cancel/{id_task}` for an unknown task |
+| `preset_unknown` | 404 | `/forge/preset/{name}` for an unknown preset |
+| `body_too_large` | 413 | Request body exceeds the per-route (W7) or global cap |
+| `validation_failed` | 422 | Pydantic field errors; `errors[]` array populated |
+| `rate_limited` | 429 | Rate limit exceeded (W8); response carries `Retry-After` and `X-RateLimit-*` headers |
+| `http_error` | varies | Generic fallback when no specific code applies |
+
+Codes are stable strings — they are appended over time, NEVER
+renamed. Clients should switch on `body.code`; humans read
+`body.detail`. The list above is the canonical catalog; any new
+code introduced in a future release will appear here with the same
+shape.
 
 ## Cross-cutting headers
 
@@ -223,7 +360,8 @@ All routes return JSON. Successful responses are 200 unless noted.
 
 Cheapest probe. Returns fork name / version / commit so a client can
 distinguish this fork from upstream Forge Neo / vanilla A1111 without
-sending credentials.
+sending credentials. Also surfaces `capabilities[]` (W4) so a client
+can negotiate features before authenticating.
 
 ```json
 {
@@ -231,9 +369,17 @@ sending credentials.
   "fork_version": "0.1.0",
   "fork_commit": "...",
   "upstream": "forge-neo",
-  "upstream_commit": "..."
+  "upstream_commit": "...",
+  "capabilities": ["error-format-problem-details", "forge/preset", "health", "identify", "..."]
 }
 ```
+
+The `capabilities` array is a sorted, filtered subset of the full
+registry. Names matching deployment-leak shapes (raw hex SHAs, names
+ending in `.safetensors`/`.ckpt`/`.pt`/`.gguf`/etc.) are stripped on
+egress so a future registration accident cannot publicly leak
+checkpoint filenames or commit hashes. The full registry is still
+visible on the post-auth `/health.capabilities[]`.
 
 Capability: `identify`.
 
@@ -319,18 +465,53 @@ caller can audit what changed.
 
 Unknown name → 404. Capability: `forge/preset`.
 
-### `GET /livez` — k8s liveness
+### `GET /livez` — k8s liveness — public
 
-Unconditional 200. Tests the event loop only; never gated on model
-state. Capability: `livez`.
+Unconditional 200, returns `{"status": "live"}`. Tests the event loop
+only; never gated on model state, never auth-gated. Cloud
+orchestrators can poll without injecting credentials. Capability:
+`health/livez` (legacy alias `livez` also emitted during the W15 deprecation window).
 
-### `GET /readyz` — k8s readiness
+### `GET /readyz` — k8s readiness — public
 
 200 + `{"status": "ready", ...}` when torch is importable, a checkpoint
-is loaded, and no fatal condition is recorded. 503 +
-`{"status": "not_ready", "checks": {...}}` otherwise. Modules surface
-fatal errors via `livez_readyz.record_last_error(kind, detail)` and
-clear with `clear_last_error()`. Capability: `readyz`.
+is loaded, no fatal condition is recorded, and the surface is not
+draining. 503 + `{"status": "not_ready", "checks": {...}}` otherwise.
+
+Public (unauth) body — sanitised, booleans only:
+
+```json
+{
+  "status": "ready" | "not_ready",
+  "checks": {
+    "torch_importable": true,
+    "model_loaded": true,
+    "has_error": false,
+    "draining": false
+  }
+}
+```
+
+Verbose body — `?verbose=1`, requires Basic auth when `--api-auth`
+is configured; without auth configured, verbose is open:
+
+```json
+{
+  "status": "ready" | "not_ready",
+  "checks": {
+    "torch_importable": true,
+    "model_loaded": true,
+    "last_error": {"kind": "...", "detail": "...", "recorded_at": 1715347200.0} | null,
+    "draining": false
+  }
+}
+```
+
+Modules surface fatal errors via
+`livez_readyz.record_last_error(kind, detail)` and clear with
+`clear_last_error()`. The drain flag is set by the graceful-shutdown
+handler (W12) via `set_draining(True)` so k8s probes pull the pod
+from rotation during a rolling restart. Capability: `health/readyz` (legacy alias `readyz` also emitted during the W15 deprecation window).
 
 ### `GET /queue` — task introspection
 
@@ -429,6 +610,121 @@ the full listing's wire cost. Excludes `unknown` and `not_a_checkpoint`.
 
 Capability: `models/architectures-available`.
 
+## Curl examples (W21)
+
+Quick-start curl invocations for every endpoint. `API` and `AUTH`
+are placeholders — set them to your deployment's base URL and
+`user:pass`:
+
+```bash
+API=http://127.0.0.1:7860/cplugapi/v1
+AUTH=user:pass
+```
+
+### Identity / health
+
+```bash
+# /identify — unauth; fingerprint backend + discover capabilities
+curl -s $API/identify
+
+# /health — auth-gated; status + active task + queue depth
+curl -su $AUTH $API/health
+curl -su $AUTH "$API/health?detailed=true"
+
+# /version — auth-gated; verbose runtime diagnostic dump
+curl -su $AUTH $API/version
+
+# /livez — unauth; cheap event-loop liveness
+curl -s $API/livez
+
+# /readyz — unauth; sanitised readiness booleans
+curl -s $API/readyz
+
+# /readyz with full diagnostic block — requires auth when --api-auth set
+curl -su $AUTH "$API/readyz?verbose=1"
+```
+
+### Session control
+
+```bash
+# Cancel a specific task
+curl -X POST -su $AUTH "$API/session/cancel/task(txt2img-ABCXYZ)"
+
+# Cancel whatever is running; optionally drain the pending queue
+curl -X POST -su $AUTH "$API/session/preempt"
+curl -X POST -su $AUTH "$API/session/preempt?clear_pending=1"
+```
+
+### Forge presets
+
+```bash
+# Toggle to the live-sketching bundle
+curl -X POST -su $AUTH $API/forge/preset/sketch
+
+# Restore upstream defaults
+curl -X POST -su $AUTH $API/forge/preset/default
+```
+
+### Queue / models
+
+```bash
+# Queue introspection
+curl -su $AUTH $API/queue
+
+# Currently-loaded checkpoint
+curl -su $AUTH $API/models/active
+
+# Disk scan with per-file arch / dtype / error
+curl -su $AUTH $API/models/sd-checkpoints | head -c 800
+
+# Trimmed arch summary for a mode picker
+curl -su $AUTH $API/models/architectures
+```
+
+### Observability
+
+```bash
+# Prometheus metrics scrape (default: auth-gated)
+curl -su $AUTH $API/metrics | head -20
+
+# Same endpoint, no auth header — works when CPLUG_METRICS_PUBLIC=1
+curl -s $API/metrics | head -20
+```
+
+### Idempotency
+
+```bash
+# Same Idempotency-Key replays the cached response (Stripe-style).
+# Mutating methods only; key must be 8-128 chars from [A-Za-z0-9_:.-].
+KEY=$(uuidgen)
+curl -X POST -su $AUTH \
+     -H "Idempotency-Key: $KEY" \
+     "$API/session/preempt"
+
+# Replay — same key, same response, plus Idempotency-Replayed: true header
+curl -i -X POST -su $AUTH \
+     -H "Idempotency-Key: $KEY" \
+     "$API/session/preempt" | head -10
+```
+
+### Request correlation
+
+```bash
+# Client-supplied request id — echoed on response + threaded through logs
+curl -i -su $AUTH \
+     -H "X-Request-Id: req_my-stroke-42" \
+     "$API/health" | head -10
+```
+
+### Distributed tracing (W11)
+
+```bash
+# Inbound W3C traceparent is parsed + echoed; absent/malformed -> generated
+curl -i -su $AUTH \
+     -H "traceparent: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01" \
+     "$API/health" | head -10
+```
+
 ## Architecture vocabulary
 
 `arch` strings are lowercase identifiers from a fixed vocabulary (see
@@ -461,19 +757,48 @@ session/preempt
 forge/preset
 security/csrf-host-bodylimit
 idempotency
-livez
-readyz
+health/livez
+health/readyz
 queue
 models/architecture
 models/disk-scan
 models/architectures-available
-request-log
-gen-timing
-sdapi-request-log
+observability/request-log
+observability/gen-timing
+observability/sdapi-request-log
+observability/upscale-log
 sdapi/preempt
 sdapi/preempt-<mode>
 controlnet/patcher-cache
 ```
+
+### Deprecation window — legacy single-segment aliases
+
+W15 re-namespaced four fork-local observability capabilities and the
+two K8s probe capabilities under `observability/*` and `health/*` to
+match the slash-only convention. The legacy single-segment strings
+remain advertised for one release cycle so the desktop client can
+migrate without a flag-day:
+
+| Active (canonical) | Legacy alias (still emitted, deprecated) |
+|---|---|
+| `observability/request-log` | `request-log` |
+| `observability/gen-timing` | `gen-timing` |
+| `observability/sdapi-request-log` | `sdapi-request-log` |
+| `observability/upscale-log` | `upscale-log` |
+| `health/livez` | `livez` |
+| `health/readyz` | `readyz` |
+
+Both strings appear on `/health.capabilities[]` and
+`/identify.capabilities[]` simultaneously (dual emission). The legacy
+strings are also listed on a separate `deprecated_capabilities[]` array
+on both endpoints — clients SHOULD gate feature detection on the
+namespaced string and SHOULD log a warning if any string from
+`deprecated_capabilities[]` is still in their gating set, so the
+migration is visible before the next minor where the legacy string is
+dropped. Canonical capability strings (`session/cancel`, `forge/preset`,
+`models/architecture`, etc.) are codegen-frozen on the client and are
+never renamed.
 
 ## Environment variables
 
@@ -537,6 +862,61 @@ during a gen, which floods the console during normal operation.
 | `CPLUG_FORK_COMMIT` | `unknown` | Reported in `/identify.fork_commit` and `/version`. |
 | `CPLUG_UPSTREAM_COMMIT` | `unknown` | Reported in `/identify.upstream_commit` and `/version`. |
 | `CPLUG_FORK_BUILD_DATE` | process start (UTC ISO-8601) | Reported in `/version.fork_build_date`. |
+
+## Middleware pattern (W14)
+
+Two middleware patterns coexist in `modules/cplugapi/`. The choice is
+not aesthetic — it's driven by a Starlette compatibility footgun.
+
+**Pure ASGI** (`__call__(self, scope, receive, send)`):
+- `auto_preempt`, `sdapi_observer`, `upscale_log`, `ws_auth`,
+  `tracing`, `rate_limit`, `shutdown`.
+- Use when the layer touches `/sdapi/v1/*` OR composes with
+  streaming responses (gradio long-poll endpoints under the upstream
+  surface).
+- Why: `BaseHTTPMiddleware` wraps responses through an anyio task
+  group + memory channel. A `StreamingResponse` generator that
+  raises mid-stream (encode/starlette#1438) gets mis-attributed by
+  the wrapper, producing spurious `RuntimeError: No response
+  returned`. Pure ASGI sidesteps the wrapper.
+
+**`BaseHTTPMiddleware`** (`dispatch(self, request, call_next)`):
+- `security_middleware`, `idempotency`, `access_log`, `request_id`.
+- Use for `/cplugapi/v1/*`-only layers that need the ergonomic
+  Request/Response interface and don't compose with streaming.
+- Each `BaseHTTPMiddleware` consumer's `__call__` short-circuits to
+  pure-ASGI passthrough for non-cplugapi paths and non-HTTP scopes
+  — that's the path-scope guard that keeps Starlette#1438 from
+  firing on `/sdapi/v1/*` streams.
+
+Picking the right pattern: if your middleware needs to act on
+WebSocket scopes or any path outside `/cplugapi/v1/*`, use pure
+ASGI. Otherwise, `BaseHTTPMiddleware` is fine. When unsure, default
+to pure ASGI — it's strictly more flexible at a small ergonomic
+cost.
+
+The canonical request lifecycle and install order are documented
+in `plan/cplugapi-world-class.md` §3.0 (the plan is local-only;
+the install order is also enforced by the regression test in
+`tests/cplugapi/test_idempotency.py::test_middleware_install_order_request_id_outside_idempotency`).
+
+## OpenAPI artifact (W18)
+
+The cplugapi OpenAPI v3 spec is generated by
+`scripts/export_cplugapi_openapi.py` and uploaded as a workflow
+artifact on every push/PR that touches `modules/cplugapi/**`,
+`tests/cplugapi/**`, `modules/api/api.py`, or the workflow itself
+(see `.github/workflows/cplugapi-tests.yml`). On tag pushes the
+artifact is additionally attached to a GitHub Release for the
+client team to pin against.
+
+Local generation:
+```
+python scripts/export_cplugapi_openapi.py cplugapi-openapi.json
+```
+
+The artifact is gitignored (per project policy) — consume it from
+CI or generate it locally.
 
 ## Hard invariants (CLAUDE.md)
 

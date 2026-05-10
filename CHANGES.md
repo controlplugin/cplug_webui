@@ -7,6 +7,244 @@ grouped by **Added / Changed / Fixed / Removed**.
 
 ## Unreleased
 
+### World-class hardening (Phase WA-WC, W1-W18)
+
+A batch of 17 hardening items from `plan/cplugapi-world-class.md`
+land together as one release. Three audiences benefit:
+
+- **Desktop loopback** (primary deployment): drop-in upgrade.
+  Every existing client keeps working; new behaviour kicks in only
+  for clients that opt into it (capability detection on
+  `/identify.capabilities[]` is the discovery surface).
+- **Cloud single-replica** (newly supported): set
+  `CPLUG_DEPLOYMENT_PROFILE=cloud` and the fork flips to a coherent
+  cloud-defaults posture (wildcard Host/Origin, rate limit on,
+  auto-preempt off, reject-during-drain on). See the new
+  `doc/cplugapi-cloud-deploy.md` runbook.
+- **Security reviewers**: see the new `doc/cplugapi-threat-model.md`
+  for the full posture.
+
+#### Added — RFC 9457 Problem Details error envelope (W3)
+
+Every `/cplugapi/v1/*` error response now uses
+`application/problem+json` (RFC 9457; obsoletes 7807) with stable
+machine-switchable `code` field, `request_id` for log correlation,
+and an `errors[]` array on validation failures. Default FastAPI
+behaviour is preserved on `/sdapi/v1/*` — invariant 1
+byte-identity intact. Capability: `error-format-problem-details`.
+Codes are listed in the error catalog section of `doc/cplugapi.md`.
+(`modules/cplugapi/errors.py`)
+
+#### Added — WebSocket auth invariant shim (W2)
+
+Pure-ASGI middleware that 403s WebSocket upgrades under
+`/cplugapi/v1/*` when `--api-auth` is configured and the upgrade
+lacks valid Basic credentials. No WS endpoints exist today; the
+shim is forward-checked so a future T31 (`/session/stream/...`)
+can't silently regress invariant 4. Capability:
+`security/ws-auth-enforced`.
+(`modules/cplugapi/ws_auth.py`)
+
+#### Added — token-bucket rate limiting (W8)
+
+Three classes (`mutating` POST/PUT/PATCH/DELETE, `read`
+GET/HEAD/OPTIONS, `auth_failed` 401 observability). Off by default
+in `desktop` profile; cloud profile defaults
+`mutating=30/min`/`read=600/min`/`auth_failed=10/min`. 429
+responses use the Problem Details envelope plus standard
+`Retry-After`. Every successful response carries
+`X-RateLimit-Limit`/`-Remaining`/`-Reset`. Cloud profile requires
+`CPLUG_TRUSTED_PROXIES` for safe XFF parsing — fail-fast at
+startup. Per-credential keying on `username`-only (not
+`username + password-prefix`, which would let brute-forcers
+bypass). Capability: `security/rate-limit`.
+(`modules/cplugapi/rate_limit.py`)
+
+#### Added — Prometheus / OpenMetrics endpoint (W10)
+
+`GET /cplugapi/v1/metrics` returns text/plain;version=0.0.4 with
+`cplugapi_requests_total{method,path,status}` (counter),
+`cplugapi_request_duration_seconds{method,path}` (histogram),
+`cplugapi_idempotency_replays_total`,
+`cplugapi_active_task_id_present`. Vendored 80-LoC formatter — no
+`prometheus_client` dep. Cardinality cap of 100 distinct paths
+(overflow bucketed as `<other>`). Integrated via
+`logging.Handler` attached to `cplugapi.access` so `access_log.py`
+stays untouched. Auth-gated by default; `CPLUG_METRICS_PUBLIC=1`
+moves the endpoint to the public router for sidecar-style
+scraping. Capability: `observability/metrics`.
+(`modules/cplugapi/metrics.py`)
+
+#### Added — W3C Trace Context propagation (W11)
+
+Pure-ASGI middleware that parses inbound `traceparent`, validates
+per W3C spec (all-zero trace-id/parent-id rejected), generates one
+if absent/malformed, stashes on `request.state.traceparent` /
+`request.state.trace_id`, and echoes on the response. OpenTelemetry
+SDK integration deferred to a future `observability/trace-context-w3c-spans`
+capability when the SDK is present. Access-log emits `traceparent`
+and `trace_id` as structured-extra fields (visible when
+`CPLUG_LOG_FORMAT=json` is set; see W9). Capability:
+`observability/trace-context-w3c`.
+(`modules/cplugapi/tracing.py`)
+
+#### Added — graceful shutdown (W12)
+
+SIGTERM bridges to an async shutdown sequence:
+
+1. `livez_readyz.set_draining(True)` — drain flag visible on the
+   public `/readyz` body (`checks.draining: true`).
+2. Poll `progress.current_task` and `progress.pending_tasks` for
+   up to `CPLUG_SHUTDOWN_GRACE_S` (default 30).
+3. After grace expires, fire `shared.state.interrupt()` to abort
+   stragglers.
+
+Optional reject-during-drain middleware (`CPLUG_SHUTDOWN_REJECT_NEW=1`
+or cloud profile default) returns 503 to new POSTs against
+cplugapi and `/sdapi/v1/{txt2img,img2img}` during drain. Reads
+pass through. Uses Starlette lifespan semantics via signal-handler
+bridge (not deprecated `@app.on_event("shutdown")`). Capability:
+`ops/graceful-shutdown`.
+(`modules/cplugapi/shutdown.py`)
+
+#### Added — deployment profile (W5)
+
+`CPLUG_DEPLOYMENT_PROFILE=desktop|cloud` (default `desktop`).
+Profile flips coordinated defaults:
+
+| Knob | desktop | cloud |
+|---|---|---|
+| `CPLUG_ALLOWED_HOSTS` | loopback | `*` |
+| `CPLUG_ALLOWED_ORIGINS` | loopback regex | `*` |
+| auto_preempt mode | `always` | `off` |
+| rate-limit classes | off | on (30/600/10) |
+| reject-during-drain | off | on |
+
+Explicit env vars override profile defaults. Capability
+`deployment-profile-cloud` registered only when active.
+(`modules/cplugapi/profile.py`)
+
+#### Added — structured JSON logging mode (W9)
+
+`CPLUG_LOG_FORMAT=json` swaps the formatter on every cplugapi-owned
+logger (`cplugapi.access`, `.sdapi`, `.gen_timing`, `.upscale`,
+`.preempt`, `.ws_auth`) for a stdlib-only JSON-line formatter
+emitting `{ts, level, logger, msg, ...extra}` per record.
+Un-jsonable `extra` values are repr'd, not raised. Capability:
+`observability/log-format-json` (only when active).
+(`modules/cplugapi/log_format.py`)
+
+#### Added — `capabilities[]` on `/identify` (W4)
+
+The unauthenticated `/identify` probe now surfaces the same
+capability list as `/health` (filtered through a forward-guard
+predicate that strips anything matching a 7-40-char hex SHA or a
+checkpoint-file extension). Clients can negotiate features without
+sending credentials. Same response also includes
+`deprecated_capabilities[]` per W15.
+(`modules/cplugapi/identify.py`)
+
+#### Added — per-route body-size limits (W7)
+
+`security_middleware` enforces a route-prefix table that overrides
+the global 32 MiB cap on tiny endpoints:
+
+- `POST /forge/preset/...` — 4 KiB
+- `POST /session/cancel/...` — 4 KiB
+- `POST /session/preempt` — 4 KiB
+
+Matcher uses longest-prefix-with-`/`-or-EOS termination so an
+adjacent path like `/forge/preset-bulk` correctly falls back to
+the global cap. Env override `CPLUG_ROUTE_BODY_LIMITS=METHOD:path:bytes,...`.
+Capability: `security/per-route-body-limits`.
+
+#### Added — idempotency replay header allow-list (W6)
+
+`Idempotency-Key` replay path swapped from a deny-list to an
+explicit allow-list (`Content-Type`, `Cache-Control`, `ETag`,
+`X-Cplug-*` prefix). Drops `Set-Cookie`, `Date`, `Server`,
+`X-Request-Id`, etc. from cached replays — defence-in-depth
+against future endpoints that set those headers. Middleware-order
+regression test pins the canonical install order so a future
+rebase can't silently regress correlation hygiene.
+
+#### Added — fork-local capability namespacing with dual emission (W15)
+
+Six fork-local capability strings now dual-emit a namespaced new
+name plus the legacy flat name:
+
+| Legacy (deprecated) | New |
+|---|---|
+| `request-log` | `observability/request-log` |
+| `gen-timing` | `observability/gen-timing` |
+| `sdapi-request-log` | `observability/sdapi-request-log` |
+| `upscale-log` | `observability/upscale-log` |
+| `livez` | `health/livez` |
+| `readyz` | `health/readyz` |
+
+Canonical strings (`session/cancel`, `forge/preset`,
+`models/architecture`, etc.) are NOT renamed. `/health` and
+`/identify` surface a new `deprecated_capabilities[]` array
+listing the legacy names for one minor release; removal is
+triggered by Rust client confirmation, not just elapsed time.
+
+#### Changed — `/livez` and `/readyz` move to public router (W1)
+
+K8s probes work without injecting Basic auth. Default `/readyz`
+body is sanitised for unauthenticated callers (booleans only:
+`torch_importable`, `model_loaded`, `has_error`, `draining`).
+`?verbose=1` adds the full `last_error` record but requires
+Basic auth when `--api-auth` is configured. `/livez` is
+unconditional 200. Capability strings unchanged.
+
+#### Changed — error response shape across cplugapi
+
+Every error response uses RFC 9457 problem+json (see W3 above).
+The legacy top-level `detail` field is kept populated alongside
+the new structured envelope through one minor release of dual
+emission, then removed.
+
+#### Changed — CI publishes OpenAPI artifact on tag push (W18)
+
+`.github/workflows/cplugapi-tests.yml` already uploaded
+`cplugapi-openapi.json` as a workflow artifact on every PR; a new
+`publish-openapi-on-tag` job attaches it to GitHub Releases on
+tag push for the Rust client team to pin against a stable URL.
+
+#### Documentation
+
+- New `doc/cplugapi-threat-model.md` — threat model + mitigations
+  + accepted risks (W19).
+- New `doc/cplugapi-cloud-deploy.md` — cloud deployment runbook
+  with k8s manifest sample, Prometheus scrape config, Loki/ELK
+  ingestion (W20).
+- `doc/cplugapi.md` — error code catalog (W17 — codes themselves
+  landed with W3), middleware pattern explainer (W14), OpenAPI
+  artifact section (W18), deployment profile table, per-endpoint
+  examples (W21).
+
+### Added — tagged upscale-request log
+
+`POST /sdapi/v1/extra-single-image` and `POST /sdapi/v1/img2img`
+carrying `X-Cplug-Intent: upscale` (or `upscale-img2img` /
+`upscale-refine`) now emit a tagged INFO line on the
+`cplugapi.upscale` logger:
+
+```
+upscale request: type=extras POST /sdapi/v1/extra-single-image in=128456
+upscale request: type=img2img-refine POST /sdapi/v1/img2img in=2048576
+```
+
+Pure-ASGI middleware, sniffs path + headers only (no body reads).
+`/sdapi/v1/img2img` without the intent header is silent — avoids
+mistagging every sketch stroke as an upscale. Default ON
+(`CPLUG_UPSCALE_LOG=0` to disable; upscale events are infrequent
+enough that the line doesn't flood). Capability: `upscale-log`.
+Frontend integration: client adds the header on its Img2Img-refine
+upscale path; Extras flow needs no client change. See `doc/cplugapi.md`
+"Upscale request log" for the full field reference.
+(`modules/cplugapi/upscale_log.py`)
+
 ### Added — ControlNet patcher cache
 
 `backend/patcher/controlnet.py:apply_controlnet_advanced` produces a
