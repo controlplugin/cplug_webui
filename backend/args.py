@@ -123,6 +123,7 @@ parser.add_argument(
         "untouched either way."
     ),
 )
+parser.add_argument("--enable-triton-backend", action="store_true", help="Enable the use of Triton backend in comfy-kitchen")
 
 
 class SageAttentionFuncs(enum.Enum):
@@ -130,30 +131,12 @@ class SageAttentionFuncs(enum.Enum):
     fp16_triton = "fp16_triton"
     fp16_cuda = "fp16_cuda"
     fp8_cuda = "fp8_cuda"
+    fp8_cuda_pp = "fp8_cuda++"
+    sageattn3 = "sageattn3"
 
 
-class Sage_quantization_backend(enum.Enum):
-    cuda = "cuda"
-    triton = "triton"
-
-
-class Sage_qk_quant_gran(enum.Enum):
-    per_warp = "per_warp"
-    per_thread = "per_thread"
-
-
-class Sage_pv_accum_dtype(enum.Enum):
-    fp16 = "fp16"
-    fp32 = "fp32"
-    fp16fp32 = "fp16+fp32"
-    fp32fp32 = "fp32+fp32"
-
-
-sage2 = parser.add_argument_group(description="SageAttention 2")
-sage2.add_argument("--sage2-function", type=SageAttentionFuncs, default=SageAttentionFuncs.auto, action=EnumAction)
-sage2.add_argument("--sage-quantization-backend", type=Sage_quantization_backend, default=Sage_quantization_backend.triton, action=EnumAction)
-sage2.add_argument("--sage-quant-gran", type=Sage_qk_quant_gran, default=Sage_qk_quant_gran.per_thread, action=EnumAction)
-sage2.add_argument("--sage-accum-dtype", type=Sage_pv_accum_dtype, default=Sage_pv_accum_dtype.fp32, action=EnumAction)
+sage = parser.add_argument_group(description="SageAttention")
+sage.add_argument("--sage-function", type=SageAttentionFuncs, default=SageAttentionFuncs.auto, action=EnumAction)
 
 
 args, _ = parser.parse_known_args()
@@ -164,6 +147,8 @@ if TYPE_CHECKING:
     import os
 
     import torch
+
+    from backend.misc.context_windows import IndexListContextHandler
 
 
 class _DynamicArgsMeta(type):
@@ -199,11 +184,26 @@ class dynamic_args(metaclass=_DynamicArgsMeta):
     """Flux.2 Klein"""
     wan: bool = False
     """Wan 2.2"""
+    pid: bool = False
+    """PiD"""
     ref_latents: list["torch.Tensor"] = []
     """Reference Latent(s) for Flux Kontext / Qwen-Image-Edit / Flux.2 Klein"""
     concat_latent: "torch.Tensor" = None
     """Input Latent for Wan 2.2 I2V"""
+    lq_latent: list["torch.Tensor", "torch.Tensor"] = [None, None]
+    """lq_latent & degrade_sigma for PiD"""
+    context_handler: "IndexListContextHandler" = None
+    """Context Handler for PiD"""
     is_referencing: bool = False
     """Appending Reference Latent(s) (by. ImageStitch)"""
     ops: str = None
     """Operations for the Diffusion Model"""
+    last_extra_generation_params: dict[str, str] = {}
+    """Infotext captured during `get_learned_conditioning`"""
+
+    @classmethod
+    def reset(cls):
+        cls.ref_latents.clear()
+        cls.concat_latent = None
+        cls.lq_latent = [None, None]
+        cls.context_handler = None

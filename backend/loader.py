@@ -2,7 +2,10 @@ import importlib
 import logging
 import os.path
 from functools import partial
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
+
+if TYPE_CHECKING:
+    from backend.diffusion_engine.base import ForgeDiffusionEngine
 
 import torch
 import yaml
@@ -17,6 +20,7 @@ from backend.diffusion_engine.flux import Flux
 from backend.diffusion_engine.flux2 import Flux2
 from backend.diffusion_engine.lumina import Lumina2
 from backend.diffusion_engine.mugen import Mugen
+from backend.diffusion_engine.pid import PiD
 from backend.diffusion_engine.qwen import QwenImage
 from backend.diffusion_engine.sd15 import StableDiffusion
 from backend.diffusion_engine.sdxl import StableDiffusionXL, StableDiffusionXLRefiner
@@ -38,7 +42,7 @@ from backend.utils import (
 )
 from modules_forge.packages.comfy.utils import convert_diffusers_mmdit
 
-possible_models = [StableDiffusion, StableDiffusionXLRefiner, StableDiffusionXL, Mugen, Chroma, Flux, Flux2, Wan, QwenImage, Lumina2, ZImage, Anima, ErnieImage]
+possible_models: tuple["ForgeDiffusionEngine"] = (StableDiffusion, StableDiffusionXLRefiner, StableDiffusionXL, Mugen, Chroma, Flux, Flux2, Wan, QwenImage, Lumina2, ZImage, Anima, ErnieImage, PiD)
 
 logger = logging.getLogger("loader")
 setup_logger(logger)
@@ -61,6 +65,29 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             comp = cls.from_pretrained(os.path.join(repo_path, component_name))
             comp._eventual_warn_about_too_long_sequence = lambda *args, **kwargs: None
             return comp
+
+        # region VAE
+
+        if cls_name == "PiDAutoVAE":
+            assert isinstance(state_dict, dict) and len(state_dict) > 16, "You do not have VAE state dict!"
+            _dim: int = state_dict.pop("_dim")
+
+            if _dim == 4:
+                cls_name = "AutoencoderKL"
+                config_path = os.path.join(HF, "stabilityai", "stable-diffusion-xl-base-1.0", "vae_1_0")
+            elif _dim == 128:
+                cls_name = "AutoencoderKLFlux2"
+                config_path = os.path.join(HF, "black-forest-labs", "FLUX.2-klein-9B", "vae")
+            elif _dim == 16:
+                if "decoder.middle.0.residual.0.gamma" in state_dict:
+                    cls_name = "AutoencoderKLQwenImage"
+                    config_path = os.path.join(HF, "Qwen", "Qwen-Image", "vae")
+                else:
+                    cls_name = "AutoencoderKL"
+                    config_path = os.path.join(HF, "black-forest-labs", "FLUX.1-dev", "vae")
+            else:
+                raise NotImplementedError
+
         if cls_name == "AutoencoderKL":
             assert isinstance(state_dict, dict) and len(state_dict) > 16, "You do not have VAE state dict!"
             from backend.nn.vae import IntegratedAutoencoderKL
@@ -107,6 +134,9 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
 
             load_state_dict(model, state_dict)
             return model
+
+        # region Text Encoder
+
         if component_name.startswith("text_encoder") and cls_name in ["CLIPTextModel", "CLIPTextModelWithProjection"]:
             assert isinstance(state_dict, dict) and len(state_dict) > 16, "You do not have CLIP state dict!"
             from transformers import CLIPTextConfig, CLIPTextModel
@@ -308,7 +338,10 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
 
             load_state_dict(model, state_dict, log_name=cls_name, ignore_errors=["transformer.encoder.embed_tokens.weight", "logit_scale"])
             return model
-        if cls_name in ["UNet2DConditionModel", "FluxTransformer2DModel", "Flux2Transformer2DModel", "ChromaTransformer2DModel", "WanTransformer3DModel", "QwenImageTransformer2DModel", "Lumina2Transformer2DModel", "ZImageTransformer2DModel", "CosmosTransformer3DModel", "ErnieImageTransformer2DModel"]:
+
+        # region UNet / DiT
+
+        if cls_name in ["UNet2DConditionModel", "FluxTransformer2DModel", "Flux2Transformer2DModel", "ChromaTransformer2DModel", "WanTransformer3DModel", "QwenImageTransformer2DModel", "Lumina2Transformer2DModel", "ZImageTransformer2DModel", "CosmosTransformer3DModel", "ErnieImageTransformer2DModel", "PiDTransformer2DModel"]:
             assert isinstance(state_dict, dict) and len(state_dict) > 16, "You do not have model state dict!"
             pre_func: Callable[[torch.nn.Module], torch.nn.Module] = lambda mdl: mdl
             model_loader = None
@@ -366,6 +399,10 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 from backend.nn.ernie import ErnieImageModel
 
                 model_loader = lambda c: ErnieImageModel(**c)
+            elif cls_name == "PiDTransformer2DModel":
+                from backend.nn.pixeldit.pid import PidNet
+
+                model_loader = lambda c: PidNet(**c)
 
             load_device = memory_management.get_torch_device()
             offload_device = memory_management.unet_offload_device()
@@ -379,12 +416,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
 
             override_dtype = backend.args.dynamic_args.forge_unet_storage_dtype
             if override_dtype is torch.int8:
-                if state_dict_dtype is torch.bfloat16:
-                    override_dtype = torch.bfloat16
-                    try_int8 = True
-                else:
-                    override_dtype = None
-                    logger.warning("int8 only supports bfloat16 models...")
+                override_dtype = torch.bfloat16 if memory_management.should_use_bf16(load_device) else None
+                try_int8 = True
 
             if guess.nunchaku:
                 storage_dtype = torch.bfloat16
@@ -432,6 +465,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                     extra_dtype = str(guess.__class__.__name__)
                 elif quant_config is not None:
                     extra_dtype = quant_config
+                    to_args.clear()
                 else:
                     extra_dtype = None
 
@@ -721,6 +755,32 @@ def process_anima(dit: dict[str, torch.Tensor], enc: dict[str, torch.Tensor]):
             enc[k] = dit.pop(k)
 
 
+def process_pid(state_dict: dict[str, torch.Tensor]):
+    pixel_dim = next(v for k, v in state_dict.items() if k.endswith("pixel_embedder.proj.weight")).shape[0]
+    marker = ".adaLN_modulation.0."
+
+    out = {}
+    for k, v in state_dict.items():
+        if k.startswith("_repa_projector") or k.startswith("net_ema."):
+            continue
+        if k.startswith("core."):
+            k = k[len("core.") :]
+        elif k.startswith("net."):
+            k = k[len("net.") :]
+        if "pixel_blocks." in k and marker in k:
+            p2 = v.shape[0] // (6 * pixel_dim)
+            trail = v.shape[1:]
+            vv = v.view(p2, 6, pixel_dim, *trail)
+            base, suffix = k.split(marker)
+            out[f"{base}.adaLN_modulation_msa.{suffix}"] = vv[:, 0:3].reshape(3 * p2 * pixel_dim, *trail).contiguous()
+            out[f"{base}.adaLN_modulation_mlp.{suffix}"] = vv[:, 3:6].reshape(3 * p2 * pixel_dim, *trail).contiguous()
+        else:
+            out[k] = v
+
+    state_dict.clear()
+    state_dict.update(out)
+
+
 def _load_unet(path: os.PathLike):
     import huggingface_guess
 
@@ -737,7 +797,8 @@ def _load_diffuser(path: os.PathLike):
 
     sd, metadata = load_torch_file(path, return_metadata=True)
     sd, metadata = convert_quantization(sd, metadata)
-    sd = convert_diffusers_mmdit(sd, "")
+    if (sd := convert_diffusers_mmdit(sd, "")) is None:
+        raise ModuleNotFoundError("Failed to recognize model...")
     sd = preprocess_state_dict(sd)
     guess = huggingface_guess.guess(sd)
 
@@ -747,7 +808,7 @@ def _load_diffuser(path: os.PathLike):
 def split_state_dict(path: os.PathLike, additional_state_dicts: list[os.PathLike] = None):
     try:
         sd, metadata, guess = _load_unet(path)
-    except Exception:
+    except ModuleNotFoundError:
         sd, metadata, guess = _load_diffuser(path)
     finally:
         memory_management.soft_empty_cache()
@@ -789,6 +850,9 @@ def split_state_dict(path: os.PathLike, additional_state_dicts: list[os.PathLike
 
     if "Anima" in guess.huggingface_repo:
         process_anima(state_dict["transformer"], state_dict["text_encoder"])
+    if "PiD" in guess.huggingface_repo:
+        process_pid(state_dict["transformer"])
+        state_dict["vae"]["_dim"] = guess.unet_config["lq_latent_channels"]
 
     print_dict = {k: len(v) for k, v in state_dict.items()}
     logger.debug(f"StateDict Keys: {print_dict}")
@@ -799,19 +863,17 @@ def split_state_dict(path: os.PathLike, additional_state_dicts: list[os.PathLike
 
 
 @torch.inference_mode()
-def forge_loader(sd: os.PathLike, additional_state_dicts: list[os.PathLike] = None):
-    try:
-        state_dicts, estimated_config = split_state_dict(sd, additional_state_dicts=additional_state_dicts)
-    except AttributeError:
-        raise ValueError("Failed to recognize model...") from None
+def forge_loader(sd: os.PathLike, additional_state_dicts: list[os.PathLike] = None) -> "ForgeDiffusionEngine":
+    state_dicts, estimated_config = split_state_dict(sd, additional_state_dicts=additional_state_dicts)
+    repo_name: str = estimated_config.huggingface_repo
 
-    repo_name = estimated_config.huggingface_repo
-
+    backend.args.dynamic_args.reset()
     backend.args.dynamic_args.kontext = "kontext" in str(sd).lower()
     backend.args.dynamic_args.edit = "qwen" in str(sd).lower() and "edit" in str(sd).lower()
     backend.args.dynamic_args.nunchaku = getattr(estimated_config, "nunchaku", False)
     backend.args.dynamic_args.klein = "klein" in repo_name
     backend.args.dynamic_args.wan = "Wan" in repo_name
+    backend.args.dynamic_args.pid = "PiD" in repo_name
 
     if "xl" in repo_name and "rectified" in str(sd).lower():
         estimated_config.sampling_settings["RF"] = True
@@ -869,4 +931,4 @@ def forge_loader(sd: os.PathLike, additional_state_dicts: list[os.PathLike] = No
         if any(type(estimated_config) is x for x in M.matched_guesses):
             return M(estimated_config=estimated_config, huggingface_components=huggingface_components)
 
-    raise ValueError("Failed to recognize model...") from None
+    raise ModuleNotFoundError("Failed to recognize model...")

@@ -105,7 +105,8 @@ def load_lora(lora, to_load):
 
 
 def model_lora_keys_clip(model, key_map={}):
-    sdk = model.state_dict().keys()
+    sdk: list[str] = model.state_dict().keys()
+
     for k in sdk:
         if k.endswith(".weight"):
             key_map["text_encoders.{}".format(k[: -len(".weight")])] = k  # generic lora format without any weird key names
@@ -163,6 +164,16 @@ def model_lora_keys_clip(model, key_map={}):
                     t5_index += 1
 
             key_map["lora_te{}_{}".format(t5_index, l_key.replace(".", "_"))] = k
+
+    for k in sdk:  # Anima
+        if not k.endswith(".weight"):
+            continue
+        if k.startswith("qwen3_06b.model"):
+            _key = k[len("qwen3_06b.model.layers.") : -len(".weight")]
+            key_map["lora_te_layers_{}".format(_key.replace(".", "_"))] = k
+        elif k.startswith("qwen3_06b.llm_adapter"):
+            _key = k[len("qwen3_06b.") : -len(".weight")]
+            key_map["lora_te_{}".format(_key.replace(".", "_"))] = k
 
     return key_map
 

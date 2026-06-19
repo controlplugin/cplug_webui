@@ -1,3 +1,4 @@
+import os
 import shlex
 import shutil
 import subprocess
@@ -17,14 +18,46 @@ def _ensure_uv() -> bool:
     return True
 
 
-def patch(symlink: bool):
+def _pre_check():
+    # Try to auto-install uv if it's missing so the default `--uv` flag doesn't
+    # break on fresh venvs (containers/CI never have it preinstalled).
+    _ensure_uv()
+
+    try:
+        subprocess.run(["uv", "--help"], capture_output=True)
+    except FileNotFoundError:
+        print("\n[Error] uv is not installed...")
+    except Exception:
+        print("\n[Error] Failed to access uv...")
+    else:
+        return
+
+    # Never block on stdin in a non-interactive / container / CI run — it would
+    # hang the launcher forever. Only prompt when attached to a real TTY.
+    if sys.stdin is not None and sys.stdin.isatty() and not os.environ.get("CI"):
+        input("Press Enter to Continue...")
+    raise SystemExit
+
+
+def _set_cache():
+    webui = os.path.dirname(os.path.dirname(__file__))
+    cache = os.path.normpath(os.path.join(webui, ".uv-cache"))
+
+    if not os.path.exists(cache):
+        print("[uv] Creating .uv-cache folder...")
+        os.makedirs(cache)
+
+    os.environ.setdefault("UV_CACHE_DIR", cache)
+
+
+def patch(symlink: bool, local: bool):
     if hasattr(subprocess, "__original_run"):
         return
 
-    # --uv was requested but the uv binary isn't installed yet. Bootstrap it
-    # so the launcher's default `--uv` flag doesn't break on fresh venvs.
-    if not _ensure_uv():
-        return
+    _pre_check()
+
+    if local:
+        _set_cache()
 
     subprocess.__original_run = subprocess.run
     BAD_FLAGS = ("--prefer-binary", "--ignore-installed", "-I")

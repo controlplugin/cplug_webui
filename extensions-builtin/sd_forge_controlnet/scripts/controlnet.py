@@ -20,6 +20,7 @@ from lib_controlnet.utils import (
     set_numpy_seed,
 )
 from PIL import Image
+from tqdm import tqdm
 
 import modules.scripts as scripts
 import modules.util as util
@@ -90,11 +91,11 @@ class ControlNetForForgeOfficial(scripts.Script):
         return enabled_units
 
     @staticmethod
-    def try_crop_image_with_a1111_mask(p: StableDiffusionProcessing, unit: ControlNetUnit, input_image: np.ndarray, resize_mode: external_code.ResizeMode, preprocessor) -> np.ndarray:
+    def try_crop_image_with_a1111_mask(p: StableDiffusionProcessing, unit: ControlNetUnit, input_image: np.ndarray, resize_mode: external_code.ResizeMode, preprocessor, *, _is_mask: bool = False) -> np.ndarray:
         a1111_mask_image: Optional[Image.Image] = getattr(p, "image_mask", None)
         is_only_masked_inpaint = issubclass(type(p), StableDiffusionProcessingImg2Img) and p.inpaint_full_res and a1111_mask_image is not None
         if preprocessor.corp_image_with_a1111_mask_when_in_img2img_inpaint_tab and is_only_masked_inpaint:
-            logger.info("Crop input image based on A1111 mask.")
+            logger.info(f"Cropping input {'mask' if _is_mask else 'image'} based on WebUI mask")
             input_image = [input_image[:, :, i] for i in range(input_image.shape[2])]
             input_image = [Image.fromarray(x) for x in input_image]
 
@@ -206,7 +207,7 @@ class ControlNetForForgeOfficial(scripts.Script):
 
         if mask is not None:
             mask = cv2.resize(HWC3(mask), (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
-            mask = self.try_crop_image_with_a1111_mask(p, unit, mask, resize_mode, preprocessor)
+            mask = self.try_crop_image_with_a1111_mask(p, unit, mask, resize_mode, preprocessor, _is_mask=True)
 
         image_list = [[image, mask]]
 
@@ -273,12 +274,7 @@ class ControlNetForForgeOfficial(scripts.Script):
         preprocessor_output_is_image = False
         preprocessor_output = None
 
-        def optional_tqdm(iterable, use_tqdm):
-            from tqdm import tqdm
-
-            return tqdm(iterable) if use_tqdm else iterable
-
-        for input_image, input_mask in optional_tqdm(input_list, len(input_list) > 1):
+        for input_image, input_mask in tqdm(input_list, disable=(len(input_list) < 2)):
             if unit.pixel_perfect:
                 unit.processor_res = external_code.pixel_perfect_resolution(
                     input_image,
@@ -487,6 +483,9 @@ class ControlNetForForgeOfficial(scripts.Script):
 
     @torch.no_grad()
     def process(self, p, *args, **kwargs):
+        if getattr(p, "control_net_disabled", False):
+            return
+
         self.current_params = {}
         enabled_units = self.get_enabled_units(args)
         Infotext.write_infotext(enabled_units, p)

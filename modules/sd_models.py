@@ -9,7 +9,7 @@ import torch
 from backend import memory_management
 from backend.args import dynamic_args
 from backend.loader import forge_loader
-from modules import cache, devices, errors, extra_networks, hashes, modelloader, patches, paths, processing, script_callbacks, sd_unet, sd_vae, shared  # noqa
+from modules import cache, errors, extra_networks, hashes, modelloader, paths, processing, script_callbacks, sd_unet, sd_vae, shared  # noqa
 from modules.prompt_parser import DictWithShape, SdConditioning  # noqa
 from modules.shared import cmd_opts, opts
 from modules.timer import Timer
@@ -17,8 +17,8 @@ from modules.timer import Timer
 model_dir = "Stable-diffusion"
 model_path = os.path.abspath(os.path.join(paths.models_path, model_dir))
 
-checkpoints_list = {}
-checkpoint_aliases = {}
+checkpoints_list: dict[str, "CheckpointInfo"] = {}
+checkpoint_aliases: dict[str, "CheckpointInfo"] = {}
 
 
 def replace_key(d, key, new_key, value):
@@ -59,8 +59,7 @@ class CheckpointInfo:
 
         def read_metadata():
             metadata = read_metadata_from_safetensors(filename)
-            self.modelspec_thumbnail = metadata.pop("modelspec.thumbnail", None)
-
+            metadata.pop("modelspec.thumbnail", None)
             return metadata
 
         self.metadata = {}
@@ -240,13 +239,17 @@ def read_metadata_from_safetensors(filename):
 class FakeInitialModel:
     """a dummy class for compatibility when no model is loaded yet"""
 
-    def __init__(self):
-        self.cond_stage_model = None
-        self.chunk_length = 75
+    @property
+    def first_stage_model(self):
+        return None
+
+    @property
+    def cond_stage_model(self):
+        return None
 
     def get_prompt_lengths_on_ui(self, prompt):
-        r = len(prompt.strip("!,. ").replace(" ", ",").replace(".", ",").replace("!", ",").replace(",,", ",").replace(",,", ",").replace(",,", ",").replace(",,", ",").split(","))
-        return r, math.ceil(max(r, 1) / self.chunk_length) * self.chunk_length
+        r = len(prompt.strip("!?,. ").replace(" ", ",").replace(".", ",").replace("!", ",").replace("?", ",").split(","))
+        return r, math.ceil(max(r, 1) / 75) * 75
 
 
 class SdModelData:
@@ -265,9 +268,16 @@ class SdModelData:
 model_data = SdModelData()
 
 
-def unload_model_weights(sd_model=None, info=None):
+def unload_model_weights(*args, **kwargs):
     memory_management.unload_all_models()
-    return
+
+    del model_data.sd_model
+
+    model_data.sd_model = FakeInitialModel()
+    model_data.forge_hash = ""
+
+    memory_management.soft_empty_cache()
+    gc.collect()
 
 
 def list_loaded_weights():
@@ -356,7 +366,14 @@ def forge_model_reload():
 
     timer = Timer()
 
+    _last_frame: torch.Tensor = None
+    # maintain the end_image so that FirstLastFrame is not broken
+    # when reloading Wan 2.2 models via Refiner
+
     if model_data.sd_model is not None:
+        if getattr(model_data.sd_model, "end_image", None) is not None:
+            _last_frame = model_data.sd_model.end_image.clone()
+
         model_data.sd_model = None
         model_data.forge_hash = ""
         memory_management.unload_all_models()
@@ -379,13 +396,10 @@ def forge_model_reload():
 
     try:
         sd_model = forge_loader(state_dict, additional_state_dicts=additional_state_dicts)
-    except Exception as e:
+    except Exception:
         model_data.sd_model = FakeInitialModel()
-        model_data.forge_loading_parameters = {}
         model_data.forge_hash = ""
-        errors.display(e, "forge_loader")
-        memory_management.logger.error("Failed to load diffusion model... (check README for supported models)")
-        raise BufferError("Failed to load diffusion model...") from None
+        raise
     else:
         timer.record("forge model load")
     finally:
@@ -397,6 +411,9 @@ def forge_model_reload():
     sd_model.filename = checkpoint_info.filename
     sd_model.sd_model_hash = checkpoint_info.calculate_shorthash()
     timer.record("calculate hash")
+
+    if _last_frame is not None:
+        setattr(sd_model, "end_image", _last_frame)
 
     shared.opts.data["sd_checkpoint_hash"] = checkpoint_info.sha256
     model_data.set_sd_model(sd_model)
