@@ -734,6 +734,145 @@ def is_applied(target_module=None) -> bool:
     return bool(getattr(target_module, _INSTALL_FLAG, False))
 
 
+def clear_cache() -> None:
+    """Fully release every cached patched-UNet and held cnet.
+
+    Why this exists: ``modules/sd_models.py:unload_model_weights()`` frees
+    the base model (``del`` + ``soft_empty_cache`` + ``gc.collect``) when
+    the long-running server cycles checkpoints, but it does NOT know about
+    this cache. Each ``_CacheEntry`` holds a STRONG reference to the
+    patched UNet clone (``cached_unet``), and that clone keeps the held
+    cnet alive via ``controlnet_linked_list``. Until FIFO eviction
+    (``_MAX_ENTRIES``) those objects stay pinned, partially defeating the
+    "real VRAM free" the unload is trying to achieve. We hook
+    ``unload_model_weights`` (see :func:`install_unload_hook`) to call
+    this immediately after the original frees the base model.
+
+    What it does, under ``_cache_lock``:
+
+    1. For every entry, walk to the held cnet via
+       ``cached_unet.controlnet_linked_list`` and clear the
+       ``_cplug_cache_held`` tag. This matters because a cnet's
+       ``cleanup`` may still run AFTER we clear the cache (e.g. the
+       in-flight gen's ``sampling_cleanup``). With the tag gone, the
+       wrapped cleanup falls through to the REAL
+       ``memory_management.unload_model`` instead of ``_noop_unload`` —
+       so the cnet's wrapped patcher is properly popped from
+       ``current_loaded_models`` and its VRAM can be reclaimed.
+    2. Drop the strong ``cached_unet`` reference (set it to ``None``) so
+       the patched UNet clone is no longer pinned by the cache.
+    3. Clear ``_cache`` itself.
+
+    This function never calls ``unload_model`` / ``_noop_unload`` and does
+    NOT touch ``memory_management.unload_model``. It is therefore safe to
+    call OUTSIDE the cleanup swap window — ``unload_model_weights`` runs
+    outside any cnet-cleanup, so the symbol is in its normal state. We
+    only *clear a tag*; the real unload happens later, when the (now
+    untagged) cnet's own ``cleanup`` runs through the unmodified path.
+
+    Defensive throughout: ``cached_unet`` may be ``None`` if an entry was
+    already half-released; ``controlnet_linked_list`` may be ``None`` or
+    absent on a stub; clearing the tag uses ``try/except`` because a few
+    exotic objects reject attribute writes. None of these abort the loop.
+    """
+    with _cache_lock:
+        for entry in _cache.values():
+            cached_unet = getattr(entry, "cached_unet", None)
+            if cached_unet is not None:
+                cnet = getattr(cached_unet, "controlnet_linked_list", None)
+                if cnet is not None and getattr(cnet, "_cplug_cache_held", False):
+                    try:
+                        cnet._cplug_cache_held = False
+                    except (AttributeError, TypeError):
+                        # Object refuses attribute writes — nothing more
+                        # we can do; dropping the cache ref below still
+                        # releases our hold on it.
+                        pass
+            # Drop the strong ref so the patched UNet clone is no longer
+            # pinned by this entry even before the dict is cleared.
+            try:
+                entry.cached_unet = None
+            except (AttributeError, TypeError):
+                pass
+        _cache.clear()
+
+
+# Marker stamped on the wrapped ``unload_model_weights`` so re-install
+# (webui reload, repeated setup_cplugapi) doesn't double-wrap.
+_UNLOAD_HOOK_FLAG = "_cplugapi_controlnet_cache_unload_hook"
+
+
+def install_unload_hook() -> bool:
+    """Wrap ``modules.sd_models.unload_model_weights`` to clear our cache.
+
+    The original ``unload_model_weights`` frees the base model but leaves
+    this fork's cnet cache pinning the patched-UNet clone + held cnet. We
+    wrap it so the ORIGINAL runs first (base model freed as upstream
+    intends), then :func:`clear_cache` releases our hold immediately
+    after — completing the "real VRAM free" on a checkpoint cycle.
+
+    Requirements honored:
+
+    * ``modules.sd_models`` is imported LAZILY inside this function — we
+      must not hard-import it at module top (it would drag the WebUI
+      model stack into cplugapi unit tests and into bootstrap ordering).
+    * ``*args, **kwargs`` and the return value are preserved verbatim.
+    * Idempotent: guarded by ``_UNLOAD_HOOK_FLAG`` stamped on the wrapped
+      function, so a re-install detects the existing wrap and no-ops.
+    * Fails soft: if ``modules.sd_models`` is unavailable or has no
+      ``unload_model_weights``, logs and returns ``False`` rather than
+      raising during fork bootstrap.
+
+    Returns ``True`` iff this call newly installed the wrap.
+    """
+    try:
+        import modules.sd_models as sd_models  # lazy — see docstring
+    except Exception as exc:  # noqa: BLE001 — fail soft on any import error
+        _log.warning(
+            "cplugapi: modules.sd_models unavailable (%s); "
+            "unload_model_weights hook not installed",
+            exc,
+        )
+        return False
+
+    original = getattr(sd_models, "unload_model_weights", None)
+    if original is None:
+        _log.warning(
+            "cplugapi: modules.sd_models has no unload_model_weights; "
+            "cache-clear hook not installed",
+        )
+        return False
+
+    if getattr(original, _UNLOAD_HOOK_FLAG, False):
+        # Already wrapped by a prior install — idempotent no-op.
+        return False
+
+    import functools
+
+    @functools.wraps(original)
+    def wrapped(*args, **kwargs):
+        result = original(*args, **kwargs)
+        try:
+            clear_cache()
+        except Exception:  # noqa: BLE001 — never let cache-clear break unload
+            _log.exception(
+                "cplugapi: clear_cache() raised during unload_model_weights "
+                "hook; base model unload already completed"
+            )
+        return result
+
+    # functools.wraps copies __wrapped__/__dict__ from original; stamp the
+    # flag on the NEW wrapper (and guard against the original's own dict
+    # carrying a stale flag) so a re-install sees it.
+    setattr(wrapped, _UNLOAD_HOOK_FLAG, True)
+    sd_models.unload_model_weights = wrapped
+    _log.info(
+        "cplugapi: wrapped modules.sd_models.unload_model_weights "
+        "(controlnet cache clear on checkpoint cycle)"
+    )
+    return True
+
+
 def reset_cache_for_tests() -> None:
     """Clear the cache. Test-only escape hatch.
 

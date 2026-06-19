@@ -66,6 +66,12 @@ def apply_runtime_tweaks() -> None:
     from . import controlnet_cache
 
     controlnet_cache.apply()
+    # Release the cnet cache when the server cycles checkpoints. The
+    # original ``modules.sd_models.unload_model_weights`` frees the base
+    # model but doesn't know about our cache; this hook clears it right
+    # after so the patched-UNet clone + held cnet don't stay pinned until
+    # FIFO eviction. Fails soft if sd_models is unavailable.
+    controlnet_cache.install_unload_hook()
     controlnet_cache.register_capabilities()
 
 

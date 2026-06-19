@@ -675,3 +675,133 @@ def test_wrapped_cleanup_restores_unload_after_call(monkeypatch):
 
     # After the wrapped call, unload_model is back to the real function.
     assert fake_mm.unload_model is real_unload
+
+
+# --- clear_cache + unload-hook tests --------------------------------------
+#
+# modules/sd_models.py:unload_model_weights() frees the base model on a
+# checkpoint cycle but does NOT clear this cnet cache — the held patched
+# UNet clone + cnet stay pinned until FIFO eviction. clear_cache() drops
+# those strong refs and un-tags the held cnet so a later ControlNet.cleanup
+# runs the REAL unload_model. install_unload_hook() wires clear_cache() to
+# run right after the original unload_model_weights.
+
+
+def test_clear_cache_empties_and_drops_refs(
+    fake_controlnet_module, fresh_cache,
+):
+    """clear_cache() must empty the cache (cache_size()==0) and drop the
+    strong ``cached_unet`` reference on every entry so the patched UNet
+    clone is no longer pinned."""
+    module, _, _, _ = fake_controlnet_module
+    fresh_cache.apply(module)
+
+    unet, cn, _ = _baseline_pair_with_inner_weights()
+    m = module.apply_controlnet_advanced(unet, cn, "img1", 0.5, 0.0, 1.0)
+    assert fresh_cache.cache_size() == 1
+
+    # Grab the live entry before clearing so we can assert its strong ref
+    # is dropped (set to None) by clear_cache.
+    with fresh_cache._cache_lock:
+        entry = next(iter(fresh_cache._cache.values()))
+    assert entry.cached_unet is m  # strong ref held pre-clear
+
+    fresh_cache.clear_cache()
+
+    assert fresh_cache.cache_size() == 0
+    assert entry.cached_unet is None  # strong ref dropped
+
+
+def test_clear_cache_untags_held_cnet(
+    fake_controlnet_module, fresh_cache,
+):
+    """The held cnet (reachable via cached_unet.controlnet_linked_list)
+    must have ``_cplug_cache_held`` cleared so a subsequent
+    ControlNet.cleanup runs the REAL unload_model rather than the no-op."""
+    module, _, _, _ = fake_controlnet_module
+    fresh_cache.apply(module)
+
+    unet, cn, _ = _baseline_pair_with_inner_weights()
+    m = module.apply_controlnet_advanced(unet, cn, "img1", 0.5, 0.0, 1.0)
+    cnet = m.controlnet_linked_list
+    assert getattr(cnet, "_cplug_cache_held", False) is True  # tagged on install
+
+    fresh_cache.clear_cache()
+
+    assert getattr(cnet, "_cplug_cache_held", True) is False  # tag cleared
+
+
+def test_clear_cache_safe_on_empty_cache(fresh_cache):
+    """clear_cache() on an empty cache must be a no-op, not raise."""
+    fresh_cache.reset_cache_for_tests()
+    fresh_cache.clear_cache()
+    assert fresh_cache.cache_size() == 0
+
+
+def _install_fake_sd_models(monkeypatch):
+    """Install a stub ``modules.sd_models`` exposing an
+    ``unload_model_weights`` we can spy on. Returns (module, call_log)."""
+    sd_models = types.ModuleType("modules.sd_models")
+    calls = {"count": 0, "args": None, "kwargs": None}
+
+    def unload_model_weights(*args, **kwargs):
+        calls["count"] += 1
+        calls["args"] = args
+        calls["kwargs"] = kwargs
+        return "freed"
+
+    sd_models.unload_model_weights = unload_model_weights
+    # ``import modules.sd_models`` needs ``modules`` to resolve too; the
+    # top-level conftest already stubs parts of ``modules`` but we set the
+    # attribute + sys.modules entry explicitly to be safe under any order.
+    monkeypatch.setitem(sys.modules, "modules.sd_models", sd_models)
+    return sd_models, calls
+
+
+def test_install_unload_hook_wraps_and_clears_cache(
+    fake_controlnet_module, fresh_cache, monkeypatch,
+):
+    """install_unload_hook must wrap unload_model_weights so the original
+    runs (return value preserved) AND clear_cache fires afterward."""
+    module, _, _, _ = fake_controlnet_module
+    fresh_cache.apply(module)
+
+    sd_models, calls = _install_fake_sd_models(monkeypatch)
+
+    assert fresh_cache.install_unload_hook() is True
+
+    # Populate the cache, then call the (now wrapped) unload.
+    unet, cn, _ = _baseline_pair_with_inner_weights()
+    module.apply_controlnet_advanced(unet, cn, "img1", 0.5, 0.0, 1.0)
+    assert fresh_cache.cache_size() == 1
+
+    ret = sd_models.unload_model_weights("a", b=2)
+
+    assert ret == "freed"  # original return value preserved
+    assert calls["count"] == 1  # original ran exactly once
+    assert calls["args"] == ("a",)  # *args forwarded
+    assert calls["kwargs"] == {"b": 2}  # **kwargs forwarded
+    assert fresh_cache.cache_size() == 0  # cache cleared by the hook
+
+
+def test_install_unload_hook_is_idempotent(monkeypatch):
+    """A second install must detect the existing wrap and not double-wrap."""
+    from modules.cplugapi import controlnet_cache
+
+    sd_models, _ = _install_fake_sd_models(monkeypatch)
+
+    assert controlnet_cache.install_unload_hook() is True
+    wrapped_once = sd_models.unload_model_weights
+    assert controlnet_cache.install_unload_hook() is False  # already wrapped
+    assert sd_models.unload_model_weights is wrapped_once  # not re-wrapped
+
+
+def test_install_unload_hook_fails_soft_without_symbol(monkeypatch):
+    """If modules.sd_models lacks unload_model_weights, install returns
+    False rather than raising — bootstrap must not crash."""
+    from modules.cplugapi import controlnet_cache
+
+    sd_models = types.ModuleType("modules.sd_models")  # no unload symbol
+    monkeypatch.setitem(sys.modules, "modules.sd_models", sd_models)
+
+    assert controlnet_cache.install_unload_hook() is False
