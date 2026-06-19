@@ -46,10 +46,16 @@ in-place at fork-bootstrap time. Idempotent via a class-level
 from __future__ import annotations
 
 import logging
+import threading
 
 _log = logging.getLogger(__name__)
 
 _PATCHED_FLAG = "_cplugapi_isdead_patched"
+
+# Flag stamped on ``modules.processing`` once the OOM-recovery wrapper is
+# installed, so a webui reload / second call doesn't double-wrap.
+_OOM_HOOK_FLAG = "_cplug_oom_recovery_hook_installed"
+_oom_hook_lock = threading.Lock()
 
 
 def _resolve_default_class():
@@ -136,6 +142,114 @@ def is_applied(cls=None) -> bool:
     if cls is None:
         return False
     return bool(getattr(cls, _PATCHED_FLAG, False))
+
+
+def install_oom_recovery_hook() -> bool:
+    """Wrap ``modules.processing.process_images_inner`` so an OOM raised
+    during generation reclaims VRAM before the error reaches the client.
+
+    Why this exists (audit 02 — headless OOM recovery): upstream's
+    auto-recovery only fires on the Gradio UI path (``modules/ui.py``
+    cleanup wired via Gradio events). The ControlPlugin API path never
+    hits that — ``/sdapi`` + ``/cplugapi`` generation calls
+    ``process_images(p)`` directly under ``queue_lock`` in
+    ``modules/api/api.py``, never ``main_thread.run_and_wait_result``.
+    So on the API path an OOM currently leaves VRAM occupied and can
+    wedge the next request. This wrapper restores headless recovery.
+
+    Behaviour of the wrapper:
+
+    - Runs the original ``process_images_inner`` in try/except.
+    - On exception, lazily ``from backend import memory_management`` and
+      ask ``memory_management.is_oom(e)`` whether it's an
+      OOM/accelerator error. If so, lazily ``import modules.sd_models``
+      and call ``sd_models.unload_model_weights()`` — that frees the
+      base model AND drains the ControlNet cache (the unload hook in
+      ``controlnet_cache.install_unload_hook`` wraps
+      ``unload_model_weights`` to also call ``clear_cache()``). Then
+      the original exception is **re-raised** so the request still
+      surfaces a clean error and the NEXT request starts on freed VRAM.
+    - Non-OOM exceptions are re-raised unchanged (no unload).
+    - If ``backend.memory_management`` is not importable (stub env), the
+      exception is re-raised without classification — never swallowed.
+
+    Ordering: this must be the OUTERMOST of the ``process_images_inner``
+    wrappers, so install it LAST (after ``gen_timing.install_hooks`` and
+    ``auto_preempt.install_hooks``). That way the recovery sees the fully
+    unwound generation stack — by the time the exception propagates here,
+    the inner wrappers have already returned/raised through their own
+    bookkeeping.
+
+    Idempotent and fail-soft:
+
+    Returns
+    -------
+    bool
+        True when this call newly installed the wrapper. False when it
+        was already installed, or ``modules.processing`` /
+        ``process_images_inner`` is unavailable (logged, not raised).
+    """
+    with _oom_hook_lock:
+        try:
+            from modules import processing as _proc
+        except ImportError:
+            _log.warning(
+                "cplugapi: modules.processing unavailable; "
+                "OOM-recovery hook not installed"
+            )
+            return False
+
+        if getattr(_proc, _OOM_HOOK_FLAG, False):
+            return False
+
+        original = getattr(_proc, "process_images_inner", None)
+        if not callable(original):
+            _log.warning(
+                "cplugapi: process_images_inner missing/not callable; "
+                "OOM-recovery hook not installed"
+            )
+            return False
+
+        setattr(_proc, _OOM_HOOK_FLAG, True)
+
+        def wrapped_process_images_inner(p, *args, **kwargs):
+            try:
+                return original(p, *args, **kwargs)
+            except Exception as e:
+                # Classify only when the backend is importable; in the
+                # stub test env we can't tell OOM from anything else, so
+                # we re-raise untouched rather than guess.
+                try:
+                    from backend import memory_management  # type: ignore
+                except Exception:
+                    raise
+                if memory_management.is_oom(e):
+                    _log.warning(
+                        "cplugapi: OOM during generation — unloading model "
+                        "weights to reclaim VRAM before re-raising"
+                    )
+                    try:
+                        import modules.sd_models as _sd_models
+
+                        _sd_models.unload_model_weights()
+                    except Exception:
+                        # Recovery is best-effort; never mask the OOM with
+                        # a secondary error from the cleanup path.
+                        _log.exception(
+                            "cplugapi: OOM-recovery unload_model_weights failed"
+                        )
+                # Always re-raise the original error so the request gets a
+                # clean failure and the next request starts fresh.
+                raise
+
+        wrapped_process_images_inner.__name__ = "process_images_inner"
+        wrapped_process_images_inner.__qualname__ = "process_images_inner"
+        _proc.process_images_inner = wrapped_process_images_inner
+        _log.info(
+            "cplugapi: installed headless OOM-recovery hook on "
+            "process_images_inner"
+        )
+        return True
 
 
 def register_capabilities() -> None:

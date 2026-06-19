@@ -8,8 +8,11 @@ covering every branch of the patched ``is_dead`` logic.
 
 from __future__ import annotations
 
+import sys
+import types
 import weakref
 
+import pytest
 
 from modules.cplugapi import memmgmt_patches
 
@@ -120,3 +123,177 @@ def test_double_apply_does_not_double_wrap():
     wrapped_once = cls.is_dead
     memmgmt_patches.apply(cls)
     assert cls.is_dead is wrapped_once
+
+
+# ---------------------------------------------------------------------------
+# install_oom_recovery_hook — headless OOM recovery on the API gen path.
+#
+# We stub ``modules.processing`` (the wrap target), ``modules.sd_models``
+# (the VRAM reclaim), and ``backend.memory_management`` (the OOM
+# classifier) with simple module stand-ins, mirroring the stub style in
+# ``test_gen_timing`` / ``test_auto_preempt``. The suite runs without the
+# real backend, so every backend-classified assertion is driven entirely
+# by the injected ``is_oom`` stub.
+# ---------------------------------------------------------------------------
+
+
+class _OomEnv:
+    """Bundle of stubs + bookkeeping returned by the fixture."""
+
+    def __init__(self, proc, sd_models, memmgmt):
+        self.proc = proc
+        self.sd_models = sd_models
+        self.memmgmt = memmgmt
+        self.unload_calls = 0
+
+
+@pytest.fixture
+def oom_env(monkeypatch):
+    """Install stub ``modules.processing`` + ``modules.sd_models`` +
+    ``backend.memory_management`` and the OOM-recovery hook on top.
+
+    The default ``process_images_inner`` succeeds; tests rebind it to
+    raise. ``is_oom`` defaults to classifying nothing as OOM; tests
+    override it. ``unload_model_weights`` increments a counter.
+    """
+    proc = types.ModuleType("modules.processing")
+
+    def _default_process(p, *a, **k):
+        return "result"
+
+    proc.process_images_inner = _default_process
+    monkeypatch.setitem(sys.modules, "modules.processing", proc)
+
+    env = _OomEnv(proc, None, None)
+
+    sd_models = types.ModuleType("modules.sd_models")
+
+    def _unload():
+        env.unload_calls += 1
+
+    sd_models.unload_model_weights = _unload
+    monkeypatch.setitem(sys.modules, "modules.sd_models", sd_models)
+    env.sd_models = sd_models
+
+    # ``backend`` package + ``backend.memory_management`` submodule.
+    backend_pkg = sys.modules.get("backend")
+    if backend_pkg is None:
+        backend_pkg = types.ModuleType("backend")
+        backend_pkg.__path__ = []  # mark as package so submodule import works
+        monkeypatch.setitem(sys.modules, "backend", backend_pkg)
+
+    memmgmt = types.ModuleType("backend.memory_management")
+    memmgmt.is_oom = lambda e: False  # default: nothing is OOM
+    monkeypatch.setitem(sys.modules, "backend.memory_management", memmgmt)
+    monkeypatch.setattr(backend_pkg, "memory_management", memmgmt, raising=False)
+    env.memmgmt = memmgmt
+
+    # Fresh install on this stub.
+    if hasattr(proc, memmgmt_patches._OOM_HOOK_FLAG):
+        delattr(proc, memmgmt_patches._OOM_HOOK_FLAG)
+    assert memmgmt_patches.install_oom_recovery_hook() is True
+    return env
+
+
+def _rewrap(proc):
+    """Re-install the OOM hook over the *current* ``process_images_inner``.
+
+    The wrapper captures the original at install time (same closure
+    pattern as gen_timing/auto_preempt), so a test that rebinds
+    ``proc.process_images_inner`` after the fixture installed must toggle
+    the flag and re-install to wrap the new inner. Mirrors
+    ``test_gen_timing.test_decode_inside_gen_contributes_to_vae_stage``.
+    """
+    if hasattr(proc, memmgmt_patches._OOM_HOOK_FLAG):
+        delattr(proc, memmgmt_patches._OOM_HOOK_FLAG)
+    memmgmt_patches.install_oom_recovery_hook()
+
+
+def test_oom_hook_wraps_process_images_inner(oom_env):
+    """After install the function is a different object (wrapped) and
+    the idempotency flag is stamped on the module."""
+    assert getattr(oom_env.proc, memmgmt_patches._OOM_HOOK_FLAG) is True
+    assert oom_env.proc.process_images_inner.__name__ == "process_images_inner"
+    # Happy path still passes through to the original result.
+    assert oom_env.proc.process_images_inner("p") == "result"
+    assert oom_env.unload_calls == 0
+
+
+def test_oom_classified_exception_unloads_and_reraises(oom_env):
+    class _Boom(RuntimeError):
+        pass
+
+    def _boom(p, *a, **k):
+        raise _Boom("CUDA out of memory")
+
+    oom_env.proc.process_images_inner = _boom
+    oom_env.memmgmt.is_oom = lambda e: isinstance(e, _Boom)
+    _rewrap(oom_env.proc)
+
+    with pytest.raises(_Boom):
+        oom_env.proc.process_images_inner("p")
+    # Recovery fired exactly once before the re-raise.
+    assert oom_env.unload_calls == 1
+
+
+def test_non_oom_exception_passes_through_without_unload(oom_env):
+    def _boom(p, *a, **k):
+        raise ValueError("not an oom")
+
+    oom_env.proc.process_images_inner = _boom
+    # is_oom default already returns False for everything.
+    _rewrap(oom_env.proc)
+
+    with pytest.raises(ValueError):
+        oom_env.proc.process_images_inner("p")
+    assert oom_env.unload_calls == 0
+
+
+def test_oom_recovery_swallows_unload_error_but_still_reraises(oom_env):
+    """A failure inside unload_model_weights must not mask the original
+    OOM — the OOM error still propagates."""
+
+    class _Boom(RuntimeError):
+        pass
+
+    def _boom(p, *a, **k):
+        raise _Boom("out of memory")
+
+    def _bad_unload():
+        oom_env.unload_calls += 1
+        raise RuntimeError("unload exploded")
+
+    oom_env.proc.process_images_inner = _boom
+    oom_env.memmgmt.is_oom = lambda e: True
+    oom_env.sd_models.unload_model_weights = _bad_unload
+    _rewrap(oom_env.proc)
+
+    with pytest.raises(_Boom):
+        oom_env.proc.process_images_inner("p")
+    assert oom_env.unload_calls == 1
+
+
+def test_oom_hook_idempotent(oom_env):
+    """A second install must not re-wrap; the function object stays the
+    same and a subsequent OOM still triggers exactly one unload."""
+    wrapped_once = oom_env.proc.process_images_inner
+    assert memmgmt_patches.install_oom_recovery_hook() is False
+    assert oom_env.proc.process_images_inner is wrapped_once
+
+
+def test_oom_hook_fail_soft_when_processing_unavailable(monkeypatch):
+    """If ``modules.processing`` can't be imported, install returns False
+    rather than raising."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _blocking_import(name, *a, **k):
+        if name == "modules.processing" or name == "modules":
+            raise ImportError("simulated stub env: no modules.processing")
+        return real_import(name, *a, **k)
+
+    # Ensure a cached stub doesn't satisfy the import.
+    monkeypatch.delitem(sys.modules, "modules.processing", raising=False)
+    monkeypatch.setattr(builtins, "__import__", _blocking_import)
+    assert memmgmt_patches.install_oom_recovery_hook() is False

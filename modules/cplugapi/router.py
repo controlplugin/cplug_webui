@@ -25,6 +25,7 @@ from . import (
     idempotency,
     livez_readyz,
     log_format,
+    memmgmt_patches,
     metrics,
     preset,
     profile,
@@ -136,6 +137,12 @@ def setup_cplugapi(
         # short total_ms in the gen_timing log, useful as a diagnostic
         # for "how many strokes were preempted before sampling started".
         auto_preempt.install_hooks()
+        # Headless OOM recovery. Installed LAST so it wraps OUTERMOST of
+        # the process_images_inner hooks — it sees the fully-unwound gen
+        # stack, classifies OOM via backend.memory_management.is_oom, and
+        # frees VRAM (base model + cnet cache) before re-raising. The API
+        # path never hits upstream's Gradio-only auto-recovery.
+        memmgmt_patches.install_oom_recovery_hook()
         # Demote benign Windows asyncio connection-reset noise to DEBUG.
         # The desktop client routinely closes connections to preempt
         # in-flight gens; without this filter every preempt logs a
