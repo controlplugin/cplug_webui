@@ -8,3 +8,7 @@ This is a fork of [Stable Diffusion WebUI Forge — Neo](https://github.com/Haom
 
 - [`doc/cplugapi.md`](doc/cplugapi.md) — full reference for the `/cplugapi/v1/*` HTTP surface (endpoints, capabilities, auth, env vars).
 - [`CHANGES.md`](CHANGES.md) — fork-specific changelog. Upstream changes flow in via rebase and are not duplicated.
+
+## Docker
+
+See [`docker/README.md`](docker/README.md) for the headless API backend image (build context is the repo root).

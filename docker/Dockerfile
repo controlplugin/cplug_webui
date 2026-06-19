@@ -1,5 +1,12 @@
 # syntax=docker/dockerfile:1
-# Forge Neo | NVIDIA GPU
+# cplug_webui (ControlPlugin backend, fork of Forge Neo) | NVIDIA GPU
+#
+# Build context MUST be the repository root so the fork's own source is
+# copied into the image (NOT cloned from upstream):
+#
+#     docker build -f docker/Dockerfile -t cplug_webui .
+#
+# Paths in docker/.dockerignore are repo-root-relative for that reason.
 
 ARG CUDA_VERSION=12.6.3
 
@@ -36,14 +43,14 @@ RUN groupadd -g 100 users 2>/dev/null || true \
 
 WORKDIR /home/forge/sd-webui
 
-# Clone at build time
-RUN git clone --branch neo --depth 1 --filter blob:none \
-        https://github.com/Haoming02/sd-webui-forge-classic.git . \
-    && chown -R 99:100 /home/forge
+# Own the WebUI dir before dropping privileges so the venv + source land
+# writable by the non-root runtime user.
+RUN chown -R 99:100 /home/forge
 
 USER forge
 
-# Python 3.13 Virtual ENVironment
+# Python 3.13 Virtual ENVironment — built before the source COPY so a
+# source-only change does not bust the (slow) PyTorch install layer.
 RUN uv venv venv --python 3.13 --seed
 
 ENV VIRTUAL_ENV="/home/forge/sd-webui/venv" \
@@ -54,7 +61,13 @@ ENV VIRTUAL_ENV="/home/forge/sd-webui/venv" \
 RUN uv pip install torch torchvision \
     --index-url "https://download.pytorch.org/whl/${TORCH_INDEX}"
 
-# Persistent Data Directories
+# Copy the fork's own source into the image (build context = repo root).
+# This is the fork, not an upstream clone — see header. .dockerignore
+# (repo-root-relative) keeps .git / models / local state out of the
+# context; venv/ is excluded too so this never clobbers the layer above.
+COPY --chown=99:100 . /home/forge/sd-webui
+
+# Persistent Data Directories (idempotent if already present in source)
 RUN mkdir -p \
         models/Stable-diffusion \
         models/VAE \
@@ -64,14 +77,18 @@ RUN mkdir -p \
         config \
         output
 
-# Runtime
-COPY --chown=99:100 entrypoint.sh /home/forge/sd-webui/entrypoint.sh
-RUN chmod +x /home/forge/sd-webui/entrypoint.sh
+# Runtime — entrypoint arrived via the repo-root COPY at
+# docker/entrypoint.sh; promote it to the WebUI root and mark executable.
+RUN cp /home/forge/sd-webui/docker/entrypoint.sh /home/forge/sd-webui/entrypoint.sh \
+    && chmod +x /home/forge/sd-webui/entrypoint.sh
 
 EXPOSE 7860
 
-# extra time for prepare_environment() to run on first start
+# extra time for prepare_environment() to run on first start.
+# Probe the fork's auth-exempt liveness route (200 unconditional, no UI
+# dependency) rather than the Gradio root. /cplugapi/v1/livez is mounted
+# on the public router so it answers without --api-auth credentials.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=15 \
-    CMD curl -f http://localhost:7860/ || exit 1
+    CMD curl -f http://localhost:7860/cplugapi/v1/livez || exit 1
 
 ENTRYPOINT ["/home/forge/sd-webui/entrypoint.sh"]

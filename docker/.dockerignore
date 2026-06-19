@@ -1,6 +1,60 @@
-__pycache__
-.DS_Store
-data
-*.log
+# Build context is the repository ROOT (docker build -f docker/Dockerfile .).
+# Paths below are repo-root-relative. Goal: keep the image lean and never
+# bake in local models, local state, secrets, or VCS metadata.
+
+# Version control / planning (plan/ is local-only, never shipped)
+.git
+.gitignore
+plan/
+
+# Python / build caches
+__pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
+.uv-cache/
+.cache/
+
+# Virtual environments (the image builds its own via uv)
+venv/
+.venv/
+
+# Model weights — never bake these into the image
+models/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.gguf
+*.onnx
+*.sft
+
+# Generated output / local runtime state
+outputs/
+output/
+config_states/
+embeddings/
+repositories/
+tmp/
+*.log
+config.json
+ui-config.json
+styles.csv
+styles.csv.bak
+params.txt
+user.css
+sysinfo*.json
+cplugapi-openapi.json
+
+# Local launcher overrides (may carry machine-specific args/secrets)
+webui-user.bat
+webui-user.sh
+
+# Editor / OS / tooling junk
+.vscode/
+.idea/
+.claude/
+node_modules/
+.DS_Store
+Thumbs.db
